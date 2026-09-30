@@ -231,6 +231,19 @@ impl std::ops::Mul<Rectangle<Twips>> for Matrix {
             return Default::default();
         }
 
+        if self.b == 0.0 && self.c == 0.0 {
+            // Without rotation or skew, x only depends on x and y only on y,
+            // so two opposite corners give the same result as all four.
+            let p0 = self * Point::new(rhs.x_min, rhs.y_min);
+            let p1 = self * Point::new(rhs.x_max, rhs.y_max);
+            return Rectangle {
+                x_min: p0.x.min(p1.x),
+                x_max: p0.x.max(p1.x),
+                y_min: p0.y.min(p1.y),
+                y_max: p0.y.max(p1.y),
+            };
+        }
+
         let p0 = self * Point::new(rhs.x_min, rhs.y_min);
         let p1 = self * Point::new(rhs.x_min, rhs.y_max);
         let p2 = self * Point::new(rhs.x_max, rhs.y_min);
@@ -298,10 +311,11 @@ impl From<Matrix> for swf::Matrix {
 /// (e.g., both 1.5 and 2.5 will round to 2).
 /// This is the rounding method used by Flash for the above transforms.
 /// This also clamps out-of-range values and NaN to `i32::MIN`.
+#[inline]
 fn round_to_i32(f: f32) -> i32 {
     if f.is_finite() {
         if f < 2_147_483_648.0_f32 {
-            f.round_ties_even() as i32
+            round_ties_even(f) as i32
         } else {
             // Out-of-range clamps to MIN.
             i32::MIN
@@ -309,6 +323,33 @@ fn round_to_i32(f: f32) -> i32 {
     } else {
         // NaN/Infinity goes to 0.
         0
+    }
+}
+
+/// Same result as `f32::round_ties_even`, but fast on x86-64.
+///
+/// Without SSE4.1 (the default x86-64 target), `f32::round_ties_even` is lowered
+/// to a `rintf` libcall. That call is slow, particularly with the Windows UCRT,
+/// and every matrix multiplication and transformed point goes through here.
+#[inline]
+fn round_ties_even(f: f32) -> f32 {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.1")))]
+    {
+        // Adding 2^23 leaves no mantissa bits for the fraction, so the addition itself
+        // rounds to an integer (using the default round-to-nearest-even mode), and
+        // subtracting 2^23 again is exact. Values with a magnitude of at least 2^23
+        // are already integers (or are NaN/infinite) and are returned unchanged.
+        const TWO_POW_23: f32 = 8_388_608.0;
+        let abs = f.abs();
+        if abs < TWO_POW_23 {
+            ((abs + TWO_POW_23) - TWO_POW_23).copysign(f)
+        } else {
+            f
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse4.1"))))]
+    {
+        f.round_ties_even()
     }
 }
 
@@ -992,5 +1033,129 @@ mod tests {
         assert_eq!(round_to_i32(2147483520f32), 2147483520);
         assert_eq!(round_to_i32(2147483648f32), i32::MIN);
         assert_eq!(round_to_i32(2147483904f32), i32::MIN);
+    }
+
+    fn assert_rounds_like_std(f: f32) {
+        let expected = f.round_ties_even();
+        let actual = round_ties_even(f);
+        assert!(
+            expected.to_bits() == actual.to_bits() || (expected.is_nan() && actual.is_nan()),
+            "round_ties_even({f:e} / {:#010x}): expected {expected:e}, got {actual:e}",
+            f.to_bits()
+        );
+    }
+
+    #[test]
+    fn test_round_ties_even_edge_cases() {
+        const TWO_POW_23: f32 = 8_388_608.0;
+        let edges = [
+            0.0,
+            -0.0,
+            0.49999997,
+            0.5,
+            0.50000006,
+            1.5,
+            2.5,
+            -0.5,
+            -1.5,
+            -2.5,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1e-45,
+            -1e-45,
+            TWO_POW_23 - 1.5,
+            TWO_POW_23 - 0.5,
+            TWO_POW_23,
+            TWO_POW_23 + 1.0,
+            -(TWO_POW_23 - 0.5),
+            -TWO_POW_23,
+            16_777_216.0,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for f in edges {
+            assert_rounds_like_std(f);
+        }
+        // Values around the 2^23 boundary, plus a sparse sweep over all bit patterns.
+        for i in -256..=256 {
+            let f = TWO_POW_23 + i as f32 * 0.25;
+            assert_rounds_like_std(f);
+            assert_rounds_like_std(-f);
+        }
+        for bits in (0..=u32::MAX).step_by(4099) {
+            assert_rounds_like_std(f32::from_bits(bits));
+        }
+    }
+
+    #[test]
+    fn test_axis_aligned_rectangle_mul_matches_four_corners() {
+        fn four_corners(m: Matrix, r: Rectangle<Twips>) -> Rectangle<Twips> {
+            let p = [
+                m * Point::new(r.x_min, r.y_min),
+                m * Point::new(r.x_min, r.y_max),
+                m * Point::new(r.x_max, r.y_min),
+                m * Point::new(r.x_max, r.y_max),
+            ];
+            Rectangle {
+                x_min: p.iter().map(|p| p.x).min().expect("four corners"),
+                x_max: p.iter().map(|p| p.x).max().expect("four corners"),
+                y_min: p.iter().map(|p| p.y).min().expect("four corners"),
+                y_max: p.iter().map(|p| p.y).max().expect("four corners"),
+            }
+        }
+        let scales = [
+            1.0,
+            -1.0,
+            0.0,
+            -0.0,
+            0.5,
+            -2.25,
+            1e-7,
+            3.3e4,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let rects = [
+            Rectangle {
+                x_min: Twips::new(-100),
+                x_max: Twips::new(250),
+                y_min: Twips::new(7),
+                y_max: Twips::new(9),
+            },
+            Rectangle {
+                x_min: Twips::new(0),
+                x_max: Twips::new(0),
+                y_min: Twips::new(0),
+                y_max: Twips::new(0),
+            },
+            Rectangle {
+                x_min: Twips::new(i32::MIN),
+                x_max: Twips::new(i32::MAX),
+                y_min: Twips::new(-3),
+                y_max: Twips::new(i32::MAX),
+            },
+        ];
+        for &a in &scales {
+            for &d in &scales {
+                for &c in &[0.0, -0.0] {
+                    for r in rects {
+                        let m = Matrix {
+                            a,
+                            b: -c,
+                            c,
+                            d,
+                            tx: Twips::new(-12345),
+                            ty: Twips::new(678),
+                        };
+                        assert_eq!(m * r, four_corners(m, r), "{m:?} * {r:?}");
+                    }
+                }
+            }
+        }
     }
 }
