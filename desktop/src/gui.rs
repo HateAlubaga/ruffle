@@ -48,6 +48,8 @@ pub struct RuffleGui {
 
     was_suspended_before_debug: bool,
     preferences: GlobalPreferences,
+    #[cfg(feature = "modkit")]
+    modkit: crate::modkit::ModkitHost,
 }
 
 impl RuffleGui {
@@ -76,6 +78,8 @@ impl RuffleGui {
             ),
 
             event_loop,
+            #[cfg(feature = "modkit")]
+            modkit: crate::modkit::ModkitHost::new(preferences.cli.config.clone()),
             preferences,
         }
     }
@@ -93,6 +97,8 @@ impl RuffleGui {
 
         self.menu_bar
             .consume_shortcuts(egui_ctx, &mut self.dialogs, player.as_deref_mut());
+        #[cfg(feature = "modkit")]
+        crate::modkit::consume_shortcuts(egui_ctx, player.as_deref_mut());
         if show_menu {
             self.menu_bar
                 .show(&locale, egui_ui, &mut self.dialogs, player.as_deref_mut());
@@ -103,6 +109,8 @@ impl RuffleGui {
         if let Some(player) = player {
             let was_suspended = player.debug_ui().should_suspend_player();
             player.show_debug_ui(egui_ctx, menu_height_offset);
+            #[cfg(feature = "modkit")]
+            self.modkit.pump(player);
             if was_suspended != player.debug_ui().should_suspend_player() {
                 if player.debug_ui().should_suspend_player() {
                     self.was_suspended_before_debug = !player.is_playing();

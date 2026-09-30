@@ -13,6 +13,8 @@ mod custom_event;
 mod dbus;
 mod gui;
 mod log;
+#[cfg(feature = "modkit")]
+mod modkit;
 mod player;
 mod preferences;
 #[cfg(feature = "tracy")]

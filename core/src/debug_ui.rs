@@ -5,7 +5,7 @@ mod common;
 mod display_object;
 mod domain;
 mod font;
-mod handle;
+pub(crate) mod handle;
 mod movie;
 
 use crate::context::{RenderContext, UpdateContext};
@@ -43,6 +43,8 @@ pub struct DebugUi {
     movie_list: Option<MovieListWindow>,
     domain_list: Option<DomainListWindow>,
     display_object_search: Option<DisplayObjectSearchWindow>,
+    #[cfg(feature = "modkit")]
+    modkit: crate::modkit::Modkit,
 }
 
 #[derive(Debug)]
@@ -118,6 +120,9 @@ impl DebugUi {
             self.display_object_search = Some(search);
         }
 
+        #[cfg(feature = "modkit")]
+        self.modkit.show(egui_ctx, context, movie_offset);
+
         for message in messages {
             match message {
                 Message::TrackDisplayObject(object) => {
@@ -174,7 +179,16 @@ impl DebugUi {
     }
 
     pub fn should_suspend_player(&self) -> bool {
+        #[cfg(feature = "modkit")]
+        if self.modkit.should_suspend_player() {
+            return true;
+        }
         self.display_object_search.is_some()
+    }
+
+    #[cfg(feature = "modkit")]
+    pub fn modkit(&mut self) -> &mut crate::modkit::Modkit {
+        &mut self.modkit
     }
 
     pub fn items_to_save(&mut self) -> Vec<ItemToSave> {
@@ -243,6 +257,10 @@ impl DebugUi {
                 draw_debug_rect(context, Color::RED, bounds, 5.0);
             }
         }
+
+        #[cfg(feature = "modkit")]
+        self.modkit
+            .draw_debug_rects(context, dynamic_root_set, world_matrix);
     }
 }
 

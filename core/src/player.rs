@@ -420,6 +420,10 @@ pub struct Player {
     /// Debug UI windows
     #[cfg(feature = "egui")]
     debug_ui: Rc<RefCell<crate::debug_ui::DebugUi>>,
+
+    /// Game speed factor (Modkit).
+    #[cfg(feature = "modkit")]
+    speed: crate::modkit::speed::Speed,
 }
 
 impl Player {
@@ -550,6 +554,9 @@ impl Player {
             return;
         }
 
+        #[cfg(feature = "modkit")]
+        let dt = self.speed.scale_tick(dt, &mut self.start_time);
+
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
 
@@ -596,13 +603,20 @@ impl Player {
         }
 
         // Adjust playback speed for next frame to stay in sync with timeline audio tracks ("stream" sounds).
-        let cur_frame_offset = self.frame_accumulator.as_millis();
-        let audio_skew = self.mutate_with_update_context(|context| {
-            context
-                .audio_manager
-                .audio_skew_time(context.audio, cur_frame_offset)
-        });
-        self.frame_accumulator += FloatDuration::from_secs(audio_skew);
+        // Audio can't follow a changed game speed, so don't sync to it then.
+        #[cfg(feature = "modkit")]
+        let sync_to_audio = self.speed.is_normal();
+        #[cfg(not(feature = "modkit"))]
+        let sync_to_audio = true;
+        if sync_to_audio {
+            let cur_frame_offset = self.frame_accumulator.as_millis();
+            let audio_skew = self.mutate_with_update_context(|context| {
+                context
+                    .audio_manager
+                    .audio_skew_time(context.audio, cur_frame_offset)
+            });
+            self.frame_accumulator += FloatDuration::from_secs(audio_skew);
+        }
 
         self.update_sockets();
         self.update_net_connections();
@@ -633,7 +647,24 @@ impl Player {
             time_til_next = time_til_next.min(FloatDuration::from_millis(time_til_next_timer));
         }
 
+        #[cfg(feature = "modkit")]
+        let time_til_next = self.speed.to_host_time(time_til_next);
+
         time_til_next.max(FloatDuration::ZERO).to_std()
+    }
+
+    /// Returns the game speed factor (1.0 is normal speed).
+    #[cfg(feature = "modkit")]
+    pub fn speed(&self) -> f64 {
+        self.speed.factor()
+    }
+
+    /// Sets the game speed factor, clamped to
+    /// `crate::modkit::MIN_SPEED..=crate::modkit::MAX_SPEED`.
+    /// Audio is muted while the speed isn't normal.
+    #[cfg(feature = "modkit")]
+    pub fn set_speed(&mut self, factor: f64) {
+        self.speed.set(factor, self.audio.as_mut());
     }
 
     pub fn is_playing(&self) -> bool {
@@ -666,6 +697,10 @@ impl Player {
     ///
     /// The volume should be linear and not adapted for logarithmic hearing.
     pub fn set_volume(&mut self, volume: f32) {
+        #[cfg(feature = "modkit")]
+        if self.speed.intercept_volume(volume) {
+            return;
+        }
         self.audio.set_volume(volume)
     }
 
@@ -2406,6 +2441,11 @@ impl Player {
         self.mutate_with_update_context(|context| {
             debug_ui.show(egui_ctx, context, movie_offset);
         });
+
+        #[cfg(feature = "modkit")]
+        if let Some(speed) = debug_ui.modkit().sync_speed(self.speed.factor()) {
+            self.set_speed(speed);
+        }
     }
 
     #[cfg(feature = "egui")]
@@ -3123,6 +3163,8 @@ impl PlayerBuilder {
                 notification_sender: self.notification_sender,
                 #[cfg(feature = "egui")]
                 debug_ui: Default::default(),
+                #[cfg(feature = "modkit")]
+                speed: Default::default(),
 
                 // GC data
                 gc_arena: Rc::new(RefCell::new(GcArena::new(|gc_context| {

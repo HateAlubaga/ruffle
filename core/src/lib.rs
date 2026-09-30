@@ -56,6 +56,8 @@ pub mod config;
 pub mod debug_ui;
 pub mod external;
 pub mod i18n;
+#[cfg(feature = "modkit")]
+pub mod modkit;
 pub mod stub;
 
 pub use context_menu::ContextMenuItem;

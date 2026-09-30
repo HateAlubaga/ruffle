@@ -32,6 +32,8 @@ tracing-appender = "0.2.5"
 winit = "0.30.13"
 webbrowser = "1.2.4"
 url = { workspace = true }
+reqwest = { workspace = true, optional = true, features = ["json"] }
+serde_json = { workspace = true, optional = true }
 dirs = "6.0"
 rfd = { workspace = true }
 anyhow = { workspace = true }
@@ -96,6 +98,9 @@ tracy_avm = ["tracy", "ruffle_core/tracy_avm"]
 fontconfig = ["dep:fontconfig"]
 fontconfig-dlopen = ["fontconfig", "fontconfig/dlopen"]
 freetype = ["ruffle_frontend_utils/freetype"]
+
+# Ruffle Modkit: live game editing tools (fork-only).
+modkit = ["ruffle_core/modkit", "dep:reqwest", "dep:serde_json"]
 
 # wgpu features
 render_debug_labels = ["ruffle_render_wgpu/render_debug_labels"]

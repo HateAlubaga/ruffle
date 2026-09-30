@@ -177,6 +177,8 @@ impl MenuBar {
                         }
                     });
                 });
+                #[cfg(feature = "modkit")]
+                crate::modkit::menu(ui, &mut player);
                 ui.menu_button(text(locale, "help-menu"), |ui| {
                     if ui.button(text(locale, "help-menu-join-discord")).clicked() {
                         self.launch_website(ui, "https://discord.gg/ruffle");
