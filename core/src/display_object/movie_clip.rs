@@ -3256,11 +3256,13 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 return propagate.combine_with_parent(self.into());
             }
 
-            // Check drawing, because this selects the current clip, it must have mouse enabled
-            if self
-                .bounds_with_transform(&world_matrix, BoundsMode::Engine)
-                .contains(point)
-                && let Some(drawing) = self.drawing()
+            // Check drawing, because this selects the current clip, it must have mouse enabled.
+            // Look for a drawing first: the world bounds include all children,
+            // so they are expensive, and most clips have no drawing.
+            if let Some(drawing) = self.drawing()
+                && self
+                    .bounds_with_transform(&world_matrix, BoundsMode::Engine)
+                    .contains(point)
                 && drawing.hit_test(local_matrix * point, &local_matrix)
             {
                 return if self.mouse_enabled() {
