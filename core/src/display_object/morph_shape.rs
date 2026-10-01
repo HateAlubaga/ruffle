@@ -147,11 +147,18 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
         point: Point<Twips>,
         options: HitTestOptions,
     ) -> bool {
-        if (!options.contains(HitTestOptions::SKIP_INVISIBLE) || self.visible())
-            && self.world_bounds(BoundsMode::Engine).contains(point)
+        if options.contains(HitTestOptions::SKIP_INVISIBLE) && !self.visible() {
+            return false;
+        }
+        // Same as `world_bounds` and `global_to_local_matrix`, but walks up
+        // the parent chain only once.
+        let world_matrix = self.local_to_global_matrix();
+        if self
+            .bounds_with_transform(&world_matrix, BoundsMode::Engine)
+            .contains(point)
         {
             if let Some(frame) = self.0.shared.get().frames.borrow().get(&self.ratio()) {
-                let Some(local_matrix) = self.global_to_local_matrix() else {
+                let Some(local_matrix) = world_matrix.inverse() else {
                     return false;
                 };
                 return ruffle_render::shape_utils::shape_hit_test(

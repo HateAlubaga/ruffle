@@ -2688,8 +2688,14 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             return false;
         }
 
-        if self.world_bounds(BoundsMode::Engine).contains(point) {
-            let Some(local_matrix) = self.global_to_local_matrix() else {
+        // Same as `world_bounds` and `global_to_local_matrix`, but walks up
+        // the parent chain only once.
+        let world_matrix = self.local_to_global_matrix();
+        if self
+            .bounds_with_transform(&world_matrix, BoundsMode::Engine)
+            .contains(point)
+        {
+            let Some(local_matrix) = world_matrix.inverse() else {
                 return false;
             };
             if let Some(masker) = self.masker()
@@ -3131,7 +3137,8 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
         if self.visible() {
             let this: InteractiveObject<'gc> = self.into();
-            let Some(local_matrix) = self.global_to_local_matrix() else {
+            let world_matrix = self.local_to_global_matrix();
+            let Some(local_matrix) = world_matrix.inverse() else {
                 return Avm2MousePick::Miss;
             };
 
@@ -3250,7 +3257,9 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             }
 
             // Check drawing, because this selects the current clip, it must have mouse enabled
-            if self.world_bounds(BoundsMode::Engine).contains(point)
+            if self
+                .bounds_with_transform(&world_matrix, BoundsMode::Engine)
+                .contains(point)
                 && let Some(drawing) = self.drawing()
                 && drawing.hit_test(local_matrix * point, &local_matrix)
             {

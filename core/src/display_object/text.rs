@@ -194,8 +194,15 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
         mut point: Point<Twips>,
         options: HitTestOptions,
     ) -> bool {
-        if (!options.contains(HitTestOptions::SKIP_INVISIBLE) || self.visible())
-            && self.world_bounds(BoundsMode::Engine).contains(point)
+        if options.contains(HitTestOptions::SKIP_INVISIBLE) && !self.visible() {
+            return false;
+        }
+        // Same as `world_bounds` and `global_to_local_matrix`, but walks up
+        // the parent chain only once.
+        let world_matrix = self.local_to_global_matrix();
+        if self
+            .bounds_with_transform(&world_matrix, BoundsMode::Engine)
+            .contains(point)
         {
             // Texts using the "Advanced text rendering" always hit test using their bounding box.
             if self.0.render_settings.borrow().is_advanced() {
@@ -205,7 +212,7 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
             let shared = self.0.shared.get();
 
             // Transform the point into the text's local space.
-            let Some(local_matrix) = self.global_to_local_matrix() else {
+            let Some(local_matrix) = world_matrix.inverse() else {
                 return false;
             };
             let Some(text_matrix) = shared.text_transform.inverse() else {
