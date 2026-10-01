@@ -1,3 +1,4 @@
+use crate::cli::PostProcessEffect;
 use crate::gui::MENU_HEIGHT;
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
@@ -8,7 +9,8 @@ use wgpu::util::DeviceExt;
 #[derive(Debug)]
 pub struct MovieViewRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::RenderPipeline,
+    /// One pipeline per [`PostProcessEffect`], in the order of [`PostProcessEffect::ALL`].
+    pipelines: [wgpu::RenderPipeline; PostProcessEffect::ALL.len()],
     sampler: wgpu::Sampler,
     vertices: wgpu::Buffer,
 }
@@ -74,53 +76,62 @@ impl MovieViewRenderer {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                entry_point: Some("vs_main"),
-                module: &module,
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 4 * 4,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    // 0: vec2 position
-                    // 1: vec2 texture coordinates
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
-                })],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                unclipped_depth: false,
-                conservative: false,
-                cull_mode: None,
-                front_face: wgpu::FrontFace::default(),
-                polygon_mode: wgpu::PolygonMode::default(),
-                strip_index_format: None,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                alpha_to_coverage_enabled: false,
-                count: 1,
-                mask: !0,
-            },
+        // The shader converts to linear itself when the framebuffer is sRGB.
+        let srgb_framebuffer = if surface_format.is_srgb() { 1.0 } else { 0.0 };
+        let constants = [("srgb_framebuffer", srgb_framebuffer)];
+        let pipelines = PostProcessEffect::ALL.map(|effect| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    entry_point: Some("vs_main"),
+                    module: &module,
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 4 * 4,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        // 0: vec2 position
+                        // 1: vec2 texture coordinates
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                    })],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    unclipped_depth: false,
+                    conservative: false,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::default(),
+                    polygon_mode: wgpu::PolygonMode::default(),
+                    strip_index_format: None,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    alpha_to_coverage_enabled: false,
+                    count: 1,
+                    mask: !0,
+                },
 
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some(if surface_format.is_srgb() {
-                    "fs_main_srgb_framebuffer"
-                } else {
-                    "fs_main_linear_framebuffer"
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(match effect {
+                        PostProcessEffect::None => "fs_main",
+                        PostProcessEffect::Sharpen => "fs_sharpen",
+                        PostProcessEffect::Fxaa => "fs_fxaa",
+                        PostProcessEffect::Crt => "fs_crt",
+                    }),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &constants,
+                        ..Default::default()
+                    },
                 }),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
+                multiview_mask: None,
+                cache: None,
+            })
         });
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -130,7 +141,7 @@ impl MovieViewRenderer {
 
         Self {
             bind_group_layout,
-            pipeline,
+            pipelines,
             sampler,
             vertices,
         }
@@ -211,9 +222,14 @@ impl MovieView {
     pub fn render(
         &self,
         renderer: &MovieViewRenderer,
+        effect: PostProcessEffect,
         render_pass: &mut wgpu::RenderPass<'static>,
     ) {
-        render_pass.set_pipeline(&renderer.pipeline);
+        let index = PostProcessEffect::ALL
+            .iter()
+            .position(|e| *e == effect)
+            .unwrap_or_default();
+        render_pass.set_pipeline(&renderer.pipelines[index]);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
         render_pass.set_vertex_buffer(0, renderer.vertices.slice(..));
         render_pass.draw(0..6, 0..1);
@@ -273,5 +289,27 @@ impl RenderTargetFrame for MovieViewFrame {
 
     fn view(&self) -> &wgpu::TextureView {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn blit_shader_is_valid() {
+        let module = naga::front::wgsl::parse_str(include_str!("blit.wgsl"))
+            .expect("blit.wgsl should parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("blit.wgsl should validate");
+
+        for name in ["vs_main", "fs_main", "fs_sharpen", "fs_fxaa", "fs_crt"] {
+            assert!(
+                module.entry_points.iter().any(|e| e.name == name),
+                "missing entry point {name}"
+            );
+        }
     }
 }

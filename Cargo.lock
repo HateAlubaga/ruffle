@@ -4916,6 +4916,7 @@ dependencies = [
  "gilrs",
  "image",
  "memmap2",
+ "naga",
  "os_info",
  "rand",
  "rfd",

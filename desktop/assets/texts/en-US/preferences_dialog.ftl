@@ -9,6 +9,12 @@ graphics-power = Power Preference
 graphics-power-low = Low (e.g. iGPU)
 graphics-power-high = High (e.g. GPU)
 
+post-process = Post-Processing
+post-process-none = None
+post-process-sharpen = Sharpen
+post-process-fxaa = FXAA (Anti-Aliasing)
+post-process-crt = CRT Scanlines
+
 language = Language
 
 audio-output-device = Audio Output Device

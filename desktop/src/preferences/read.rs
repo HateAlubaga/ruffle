@@ -67,6 +67,10 @@ pub fn read_preferences(input: &str) -> ParseDetails<SavedGlobalPreferences> {
         result.gamemode_preference = value;
     }
 
+    if let Some(value) = document.parse_from_str(&mut cx, "post_process") {
+        result.post_process_effect = value;
+    }
+
     if let Some(value) = document.parse_from_str(&mut cx, "open_url_mode") {
         result.open_url_mode = value;
     }
@@ -101,7 +105,7 @@ pub fn read_preferences(input: &str) -> ParseDetails<SavedGlobalPreferences> {
 mod tests {
     use super::*;
     use crate::backends::DeviceFontRenderer;
-    use crate::cli::{GameModePreference, OpenUrlMode};
+    use crate::cli::{GameModePreference, OpenUrlMode, PostProcessEffect};
     use crate::gui::ThemePreference;
     use crate::log::FilenamePattern;
     use crate::preferences::{LogPreferences, StoragePreferences, storage::StorageBackend};
@@ -659,6 +663,62 @@ mod tests {
                 expected: "string",
                 actual: "integer",
                 path: "gamemode".to_string(),
+            }],
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn post_process() {
+        let result = read_preferences("post_process = \"crt\"");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                post_process_effect: PostProcessEffect::Crt,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
+
+        let result = read_preferences("post_process = \"sharpen\"");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                post_process_effect: PostProcessEffect::Sharpen,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(Vec::<ParseWarning>::new(), result.warnings);
+
+        let result = read_preferences("post_process = \"none\"");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                post_process_effect: PostProcessEffect::None,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(
+            vec![ParseWarning::UnsupportedValue {
+                value: "none".to_string(),
+                path: "post_process".to_string(),
+            }],
+            result.warnings
+        );
+
+        let result = read_preferences("post_process = 1");
+        assert_eq!(
+            &SavedGlobalPreferences {
+                post_process_effect: PostProcessEffect::None,
+                ..Default::default()
+            },
+            result.values()
+        );
+        assert_eq!(
+            vec![ParseWarning::UnexpectedType {
+                expected: "string",
+                actual: "integer",
+                path: "post_process".to_string(),
             }],
             result.warnings
         );

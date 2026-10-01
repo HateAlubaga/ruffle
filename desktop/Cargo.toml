@@ -102,3 +102,6 @@ render_debug_labels = ["ruffle_render_wgpu/render_debug_labels"]
 
 # sandboxing
 sandbox = []
+
+[dev-dependencies]
+naga = { workspace = true, features = ["wgsl-in"] }

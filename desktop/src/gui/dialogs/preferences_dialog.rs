@@ -1,5 +1,5 @@
 use crate::backends::DeviceFontRenderer;
-use crate::cli::{GameModePreference, OpenUrlMode};
+use crate::cli::{GameModePreference, OpenUrlMode, PostProcessEffect};
 use crate::gui::{ThemePreference, available_languages, optional_text, text};
 use crate::log::FilenamePattern;
 use crate::preferences::{GlobalPreferences, storage::StorageBackend};
@@ -26,6 +26,10 @@ pub struct PreferencesDialog {
     gamemode_preference: GameModePreference,
     gamemode_preference_readonly: bool,
     gamemode_preference_changed: bool,
+
+    post_process_effect: PostProcessEffect,
+    post_process_effect_readonly: bool,
+    post_process_effect_changed: bool,
 
     language: LanguageIdentifier,
     language_changed: bool,
@@ -90,6 +94,10 @@ impl PreferencesDialog {
             gamemode_preference_readonly: preferences.cli.gamemode.is_some(),
             gamemode_preference_changed: false,
 
+            post_process_effect: preferences.post_process_effect(),
+            post_process_effect_readonly: preferences.cli.post_process.is_some(),
+            post_process_effect_changed: false,
+
             language: preferences.language(),
             language_changed: false,
 
@@ -145,6 +153,8 @@ impl PreferencesDialog {
                         .striped(true)
                         .show(ui, |ui| {
                             self.show_graphics_preferences(locale, &locked_text, ui);
+
+                            self.show_post_process_preferences(locale, &locked_text, ui);
 
                             if cfg!(target_os = "linux") {
                                 self.show_gamemode_preferences(locale, &locked_text, ui);
@@ -329,6 +339,36 @@ impl PreferencesDialog {
             });
         if self.theme_preference != previous {
             self.theme_preference_changed = true;
+        }
+        ui.end_row();
+    }
+
+    fn show_post_process_preferences(
+        &mut self,
+        locale: &LanguageIdentifier,
+        locked_text: &str,
+        ui: &mut Ui,
+    ) {
+        ui.label(text(locale, "post-process"));
+        if self.post_process_effect_readonly {
+            ui.label(post_process_effect_name(locale, self.post_process_effect))
+                .on_hover_text(locked_text);
+        } else {
+            let previous = self.post_process_effect;
+            ComboBox::from_id_salt("post-process")
+                .selected_text(post_process_effect_name(locale, self.post_process_effect))
+                .show_ui(ui, |ui| {
+                    for value in PostProcessEffect::ALL {
+                        ui.selectable_value(
+                            &mut self.post_process_effect,
+                            value,
+                            post_process_effect_name(locale, value),
+                        );
+                    }
+                });
+            if self.post_process_effect != previous {
+                self.post_process_effect_changed = true;
+            }
         }
         ui.end_row();
     }
@@ -636,6 +676,9 @@ impl PreferencesDialog {
             if self.gamemode_preference_changed {
                 preferences.set_gamemode_preference(self.gamemode_preference);
             }
+            if self.post_process_effect_changed {
+                preferences.set_post_process_effect(self.post_process_effect);
+            }
             if self.open_url_mode_changed {
                 preferences.set_open_url_mode(self.open_url_mode);
             }
@@ -684,6 +727,18 @@ fn theme_preference_name(
         ThemePreference::System => text(locale, "theme-system"),
         ThemePreference::Light => text(locale, "theme-light"),
         ThemePreference::Dark => text(locale, "theme-dark"),
+    }
+}
+
+fn post_process_effect_name(
+    locale: &LanguageIdentifier,
+    effect: PostProcessEffect,
+) -> Cow<'_, str> {
+    match effect {
+        PostProcessEffect::None => text(locale, "post-process-none"),
+        PostProcessEffect::Sharpen => text(locale, "post-process-sharpen"),
+        PostProcessEffect::Fxaa => text(locale, "post-process-fxaa"),
+        PostProcessEffect::Crt => text(locale, "post-process-crt"),
     }
 }
 

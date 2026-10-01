@@ -4,7 +4,7 @@ mod write;
 pub mod storage;
 
 use crate::backends::DeviceFontRenderer;
-use crate::cli::{GameModePreference, OpenUrlMode, Opt};
+use crate::cli::{GameModePreference, OpenUrlMode, Opt, PostProcessEffect};
 use crate::gui::ThemePreference;
 use crate::log::FilenamePattern;
 use crate::preferences::read::read_preferences;
@@ -203,6 +203,15 @@ impl GlobalPreferences {
             .recent_limit
     }
 
+    pub fn post_process_effect(&self) -> PostProcessEffect {
+        self.cli.post_process.unwrap_or_else(|| {
+            self.preferences
+                .lock()
+                .expect("Non-poisoned preferences")
+                .post_process_effect
+        })
+    }
+
     pub fn theme_preference(&self) -> ThemePreference {
         self.preferences
             .lock()
@@ -284,6 +293,7 @@ pub struct SavedGlobalPreferences {
     pub graphics_backend: GraphicsBackend,
     pub graphics_power_preference: PowerPreference,
     pub gamemode_preference: GameModePreference,
+    pub post_process_effect: PostProcessEffect,
     pub language: LanguageIdentifier,
     pub output_device: Option<String>,
     pub mute: bool,
@@ -309,6 +319,7 @@ impl Default for SavedGlobalPreferences {
             graphics_backend: Default::default(),
             graphics_power_preference: Default::default(),
             gamemode_preference: Default::default(),
+            post_process_effect: Default::default(),
             language: locale,
             output_device: None,
             mute: false,

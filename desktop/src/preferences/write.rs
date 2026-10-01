@@ -1,5 +1,5 @@
 use crate::backends::DeviceFontRenderer;
-use crate::cli::{GameModePreference, OpenUrlMode};
+use crate::cli::{GameModePreference, OpenUrlMode, PostProcessEffect};
 use crate::gui::ThemePreference;
 use crate::log::FilenamePattern;
 use crate::preferences::storage::StorageBackend;
@@ -119,6 +119,17 @@ impl<'a> PreferencesWriter<'a> {
                 toml_document.remove("gamemode");
             }
             values.gamemode_preference = gamemode_preference;
+        });
+    }
+
+    pub fn set_post_process_effect(&mut self, effect: PostProcessEffect) {
+        self.0.edit(|values, toml_document| {
+            if let Some(effect) = effect.as_str() {
+                toml_document["post_process"] = value(effect);
+            } else {
+                toml_document.remove("post_process");
+            }
+            values.post_process_effect = effect;
         });
     }
 
@@ -347,6 +358,20 @@ mod tests {
         test(
             "open_url_mode = \"deny\"",
             |writer| writer.set_open_url_mode(OpenUrlMode::Confirm),
+            "",
+        );
+    }
+
+    #[test]
+    fn set_post_process_effect() {
+        test(
+            "",
+            |writer| writer.set_post_process_effect(PostProcessEffect::Fxaa),
+            "post_process = \"fxaa\"\n",
+        );
+        test(
+            "post_process = \"crt\"",
+            |writer| writer.set_post_process_effect(PostProcessEffect::None),
             "",
         );
     }

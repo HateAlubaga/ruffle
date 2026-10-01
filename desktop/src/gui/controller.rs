@@ -48,6 +48,7 @@ pub struct GuiController {
     /// If this is set, we should not render the main menu.
     no_gui: bool,
     theme_controller: ThemeController,
+    preferences: GlobalPreferences,
     #[cfg(feature = "tracy_images")]
     tracy_frame_captures: crate::tracy::FrameCapturesHolder,
 }
@@ -178,6 +179,7 @@ impl GuiController {
             size,
             no_gui,
             theme_controller,
+            preferences,
             #[cfg(feature = "tracy_images")]
             tracy_frame_captures,
         })
@@ -463,7 +465,11 @@ impl GuiController {
                 .forget_lifetime();
 
             if let Some(movie_view) = movie_view {
-                movie_view.render(&self.movie_view_renderer, &mut render_pass);
+                movie_view.render(
+                    &self.movie_view_renderer,
+                    self.preferences.post_process_effect(),
+                    &mut render_pass,
+                );
             }
 
             self.egui_renderer

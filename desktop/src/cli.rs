@@ -84,6 +84,12 @@ pub struct Opt {
     #[cfg_attr(not(target_os = "linux"), clap(hide = true))]
     pub gamemode: Option<GameModePreference>,
 
+    /// Post-processing effect applied to the movie image when it is drawn to the window.
+    ///
+    /// This option temporarily overrides any stored preference.
+    #[clap(long)]
+    pub post_process: Option<PostProcessEffect>,
+
     /// Type of storage backend to use. This determines where local storage data is saved (e.g. shared objects).
     ///
     /// This option temporarily overrides any stored preference.
@@ -341,6 +347,50 @@ impl FromStr for GameModePreference {
         match s {
             "on" => Ok(GameModePreference::On),
             "off" => Ok(GameModePreference::Off),
+            _ => Err(()),
+        }
+    }
+}
+
+/// A shader effect applied to the whole movie image when it is drawn to the window.
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum PostProcessEffect {
+    #[default]
+    None,
+    /// Sharpens soft edges without causing halos.
+    Sharpen,
+    /// Fast approximate anti-aliasing.
+    Fxaa,
+    /// Scanlines and an aperture grille, like an old monitor.
+    Crt,
+}
+
+impl PostProcessEffect {
+    pub const ALL: [PostProcessEffect; 4] = [
+        PostProcessEffect::None,
+        PostProcessEffect::Sharpen,
+        PostProcessEffect::Fxaa,
+        PostProcessEffect::Crt,
+    ];
+
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            PostProcessEffect::None => None,
+            PostProcessEffect::Sharpen => Some("sharpen"),
+            PostProcessEffect::Fxaa => Some("fxaa"),
+            PostProcessEffect::Crt => Some("crt"),
+        }
+    }
+}
+
+impl FromStr for PostProcessEffect {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "sharpen" => Ok(PostProcessEffect::Sharpen),
+            "fxaa" => Ok(PostProcessEffect::Fxaa),
+            "crt" => Ok(PostProcessEffect::Crt),
             _ => Err(()),
         }
     }
