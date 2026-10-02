@@ -272,6 +272,7 @@ fn settings_to_json(settings: &ModkitSettings) -> String {
         "ai_base_url": settings.ai_base_url,
         "ai_model": settings.ai_model,
         "ai_api_key": settings.ai_api_key,
+        "ai_auto_pause": settings.ai_auto_pause,
     });
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
@@ -290,6 +291,10 @@ fn settings_from_json(text: &str) -> Option<ModkitSettings> {
         ai_base_url: string("ai_base_url"),
         ai_model: string("ai_model"),
         ai_api_key: string("ai_api_key"),
+        ai_auto_pause: json
+            .get("ai_auto_pause")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     })
 }
 
@@ -377,6 +382,7 @@ mod tests {
             ai_base_url: "https://example.com".into(),
             ai_model: "m".into(),
             ai_api_key: "k".into(),
+            ai_auto_pause: false,
         };
         let json = settings_to_json(&settings);
         assert_eq!(settings_from_json(&json), Some(settings));

@@ -54,6 +54,7 @@ enum Action<'gc> {
     },
     ReloadMods,
     ApplyAiAsRule,
+    SaveSessionEdits,
 }
 
 /// One selected object, read for this pass.
@@ -139,8 +140,22 @@ impl Modkit {
             ui.selectable_value(&mut self.tab, Tab::Mods, "Mods");
             ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
         });
-        ui.horizontal(|ui| {
-            ui.toggle_value(&mut self.paused, "⏸ Pause");
+        ui.horizontal_wrapped(|ui| {
+            let pause_label = if self.paused {
+                "▶ Resume"
+            } else {
+                "⏸ Pause"
+            };
+            let pause = ui.toggle_value(&mut self.paused, pause_label);
+            if self.auto_paused {
+                pause.clone().on_hover_text(
+                    "Paused for the AI request. Resumes when you apply or dismiss the patch.",
+                );
+            }
+            if pause.changed() {
+                // The user took over.
+                self.auto_paused = false;
+            }
             let pick_label = if self.picking {
                 "Picking… (Esc)"
             } else {
@@ -164,6 +179,21 @@ impl Modkit {
             };
             if undo.clicked() {
                 actions.push(Action::Undo);
+            }
+            let edits = self.session_edits().len();
+            if ui
+                .add_enabled(
+                    edits > 0,
+                    egui::Button::new(format!("💾 Save edits ({edits})")),
+                )
+                .on_hover_text(format!(
+                    "Keep every property edited in this session (by hand or by the AI) \
+                     as rules ({}) of its class, in a mod file for this game",
+                    self.rule_trigger.name()
+                ))
+                .clicked()
+            {
+                actions.push(Action::SaveSessionEdits);
             }
         });
         ui.horizontal(|ui| {
@@ -730,6 +760,11 @@ impl Modkit {
             );
             ui.end_row();
         });
+        ui.checkbox(
+            &mut settings.ai_auto_pause,
+            "Pause the game while the AI works",
+        )
+        .on_hover_text("From 'Send to AI' until you apply or dismiss the patch");
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             ui.weak(
                 "Settings are saved by the frontend. The key is only sent to the base URL, \
@@ -796,7 +831,6 @@ impl Modkit {
         pass: u64,
     ) {
         let dynamic_root = activation.context.dynamic_root;
-        let as_rule = matches!(action, Action::ApplyAiAsRule);
         match action {
             Action::Edit(edit) => self.edit(activation, edit, Some(pass)),
             Action::ToggleLock {
@@ -850,23 +884,10 @@ impl Modkit {
             }
             Action::Undo => self.undo(activation),
             Action::StartAi => self.start_ai_request(activation),
-            Action::CancelAi | Action::RejectAi => self.ai.state = AiState::Idle,
-            Action::ApplyAi | Action::ApplyAiAsRule => {
-                if let AiState::Review {
-                    changes, enabled, ..
-                } = std::mem::take(&mut self.ai.state)
-                {
-                    let chosen: Vec<_> = changes
-                        .into_iter()
-                        .zip(enabled)
-                        .filter_map(|(c, on)| on.then_some(c))
-                        .collect();
-                    let applied = self.apply_changes(activation, &chosen);
-                    if as_rule {
-                        self.queue_rules_for(activation, &applied);
-                    }
-                }
-            }
+            Action::CancelAi | Action::RejectAi => self.dismiss_ai(),
+            Action::SaveSessionEdits => self.save_session_edits(activation),
+            Action::ApplyAi => self.apply_ai(activation, false),
+            Action::ApplyAiAsRule => self.apply_ai(activation, true),
             Action::SaveRule {
                 class,
                 target,

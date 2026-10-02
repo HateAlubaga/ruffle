@@ -74,16 +74,33 @@ impl AiProvider {
 
 /// Settings owned by the frontend (which persists them) and edited in the
 /// Modkit window.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModkitSettings {
     /// Path to `ffdec-cli` (or `ffdec.jar` / `ffdec.bat`).
     pub ffdec_path: String,
     pub ai_provider: AiProvider,
     /// Empty means `ai_provider.default_base_url()`.
     pub ai_base_url: String,
+    /// Empty means the `RUFFLE_MODKIT_MODEL` environment variable.
     pub ai_model: String,
     /// Empty means the provider's environment variable.
     pub ai_api_key: String,
+    /// Pause the game while an AI request is pending and under review, and
+    /// resume when the patch is applied or dismissed.
+    pub ai_auto_pause: bool,
+}
+
+impl Default for ModkitSettings {
+    fn default() -> Self {
+        Self {
+            ffdec_path: String::new(),
+            ai_provider: AiProvider::default(),
+            ai_base_url: String::new(),
+            ai_model: String::new(),
+            ai_api_key: String::new(),
+            ai_auto_pause: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +243,8 @@ pub struct Modkit {
     tab: Tab,
     /// Paused from the Modkit window.
     paused: bool,
+    /// `paused` was set by an AI request, not by the user, and ends with it.
+    auto_paused: bool,
     picking: bool,
     pick_hover: Option<DisplayObjectHandle>,
     registry: Registry,
@@ -588,12 +607,55 @@ impl Modkit {
         });
     }
 
+    /// Pauses the game for the AI round trip, unless it is paused already.
+    fn auto_pause(&mut self) {
+        if self.settings.ai_auto_pause && !self.paused {
+            self.paused = true;
+            self.auto_paused = true;
+        }
+    }
+
+    /// Ends a pause made by `auto_pause`. A pause the user chose stays.
+    fn auto_resume(&mut self) {
+        if std::mem::take(&mut self.auto_paused) {
+            self.paused = false;
+        }
+    }
+
+    /// One entry per property edited in this session, from its first old
+    /// value to its last new one. Edits that were changed back are dropped.
+    fn session_edits(&self) -> Vec<UndoEntry> {
+        let mut net: Vec<UndoEntry> = Vec::new();
+        for entry in self.undo.iter().flat_map(|batch| &batch.entries) {
+            match net
+                .iter_mut()
+                .find(|e| e.id == entry.id && e.prop == entry.prop)
+            {
+                Some(existing) => existing.new = entry.new.clone(),
+                None => net.push(entry.clone()),
+            }
+        }
+        net.retain(|e| e.old != e.new);
+        net
+    }
+
+    fn save_session_edits<'gc>(&mut self, activation: &mut Activation<'_, 'gc>) {
+        let edits = self.session_edits();
+        if edits.is_empty() {
+            self.status = "No edits to save".into();
+            return;
+        }
+        self.status = format!("{} edited properties", edits.len());
+        self.queue_rules_for(activation, &edits);
+    }
+
     fn start_ai_request<'gc>(&mut self, activation: &mut Activation<'_, 'gc>) {
         let roots = self.selected_objects(activation.context.dynamic_root);
         if roots.is_empty() {
             self.status = "Select at least one object first".into();
             return;
         }
+        self.auto_pause();
         let snapshot =
             inspect::build_snapshot(activation, &roots, &self.ai.limits, &mut self.registry);
         let json = snapshot.to_llm_json(&self.ai.limits);
@@ -619,6 +681,33 @@ impl Modkit {
             request_id: id,
             snapshot,
         };
+    }
+
+    /// Rejects, dismisses or cancels the AI patch, and ends the pause it made.
+    fn dismiss_ai(&mut self) {
+        self.ai.state = AiState::Idle;
+        self.auto_resume();
+    }
+
+    /// Applies the ticked changes of the patch under review, and ends the
+    /// pause the request made. With `as_rule` they are also queued as rules.
+    fn apply_ai<'gc>(&mut self, activation: &mut Activation<'_, 'gc>, as_rule: bool) {
+        let AiState::Review {
+            changes, enabled, ..
+        } = std::mem::take(&mut self.ai.state)
+        else {
+            return;
+        };
+        let chosen: Vec<_> = changes
+            .into_iter()
+            .zip(enabled)
+            .filter_map(|(change, on)| on.then_some(change))
+            .collect();
+        let applied = self.apply_changes(activation, &chosen);
+        if as_rule {
+            self.queue_rules_for(activation, &applied);
+        }
+        self.auto_resume();
     }
 
     fn on_ai_response(&mut self, id: u64, result: Result<String, String>) {
