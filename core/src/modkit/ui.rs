@@ -873,7 +873,10 @@ impl Modkit {
                 prop,
                 value,
             } => {
-                let value = value.to_json(self.ai.limits.max_string_len);
+                let Some(value) = value.to_json_exact() else {
+                    self.status = format!("{prop}: NaN and infinity can't be saved as a rule");
+                    return;
+                };
                 self.requests.push(HostRequest::SaveRule {
                     rule: RuleSpec {
                         class,

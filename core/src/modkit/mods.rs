@@ -448,10 +448,17 @@ enum PropState {
         value: PropValue,
         /// Skip the write when the property already holds the value.
         compare: Option<PropKind>,
+        /// Writes that failed in a row. A write can fail for a reason that
+        /// passes (a setter that throws on some frames), so one failure does
+        /// not end the rule; `MAX_WRITE_FAILURES` in a row do.
+        failures: u8,
     },
     /// Cannot be applied; the reason is in the rule's errors.
     Dead,
 }
+
+/// A property that fails this many writes in a row is given up.
+const MAX_WRITE_FAILURES: u8 = 20;
 
 /// A rule together with what was learned about its properties. Properties
 /// belong to the class, so the state is shared by all of its instances.
@@ -801,6 +808,7 @@ fn apply_prop<'gc>(
                     access: w.access,
                     value: w.value,
                     compare: w.comparable.then_some(w.kind),
+                    failures: 0,
                 },
                 Err(e) => {
                     rule.note_error(format!("{name}: {e}"));
@@ -816,6 +824,7 @@ fn apply_prop<'gc>(
         access,
         value,
         compare,
+        failures,
     } = state
     else {
         return;
@@ -827,10 +836,27 @@ fn apply_prop<'gc>(
         return;
     }
     match inspect::write_prop(activation, object, &access, &value) {
-        Ok(()) => rule.applied.set(rule.applied.get() + 1),
+        Ok(()) => {
+            rule.applied.set(rule.applied.get() + 1);
+            if failures > 0
+                && let PropState::Ready { failures, .. } = &mut entry.props.borrow_mut()[index]
+            {
+                *failures = 0;
+            }
+        }
         Err(e) => {
             rule.note_error(format!("{name}: {e}"));
-            entry.props.borrow_mut()[index] = PropState::Dead;
+            let mut props = entry.props.borrow_mut();
+            let dead = match &mut props[index] {
+                PropState::Ready { failures, .. } => {
+                    *failures += 1;
+                    *failures >= MAX_WRITE_FAILURES
+                }
+                _ => false,
+            };
+            if dead {
+                props[index] = PropState::Dead;
+            }
         }
     }
 }

@@ -518,7 +518,6 @@ impl Modkit {
         applied: &[UndoEntry],
     ) {
         let dynamic_root = activation.context.dynamic_root;
-        let max_len = self.ai.limits.max_string_len;
         let mut rules: Vec<RuleSpec> = Vec::new();
         let mut skipped = 0;
         for entry in applied {
@@ -538,7 +537,10 @@ impl Modkit {
             } else {
                 Target::Instance
             };
-            let value = entry.new.to_json(max_len);
+            let Some(value) = entry.new.to_json_exact() else {
+                skipped += 1;
+                continue;
+            };
             match rules
                 .iter_mut()
                 .find(|r| r.class == class && r.target == target)
@@ -562,7 +564,7 @@ impl Modkit {
         }
         if skipped > 0 {
             self.status.push_str(&format!(
-                "; {skipped} not saved as rules (no game class, or dynamic)"
+                "; {skipped} not saved as rules (no game class, dynamic, or NaN/infinity)"
             ));
         }
         if count > 0 {

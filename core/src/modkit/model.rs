@@ -64,6 +64,16 @@ impl PropValue {
         }
     }
 
+    /// The value as JSON, whole: no truncation. `None` for NaN and infinity,
+    /// which JSON cannot hold. For data that is stored, not displayed.
+    pub fn to_json_exact(&self) -> Option<Json> {
+        match self {
+            PropValue::Number(v) => serde_json::Number::from_f64(*v).map(Json::Number),
+            PropValue::String(v) => Some(Json::String(v.clone())),
+            other => Some(other.to_json(0)),
+        }
+    }
+
     /// Converts a JSON value to `kind` without any lossy coercion.
     ///
     /// Integers may be written as `5` or `5.0`, but never `5.5` or `"5"`.
@@ -695,5 +705,20 @@ mod tests {
             json!("-Infinity")
         );
         assert_eq!(PropValue::String("abcdef".into()).to_json(3), json!("abc…"));
+    }
+
+    #[test]
+    fn exact_json_is_never_truncated_or_stringified() {
+        let long = "x".repeat(1000);
+        assert_eq!(
+            PropValue::String(long.clone()).to_json_exact(),
+            Some(json!(long))
+        );
+        assert_eq!(PropValue::Int(-3).to_json_exact(), Some(json!(-3)));
+        assert_eq!(PropValue::Uint(7).to_json_exact(), Some(json!(7)));
+        assert_eq!(PropValue::Boolean(true).to_json_exact(), Some(json!(true)));
+        assert_eq!(PropValue::Number(0.5).to_json_exact(), Some(json!(0.5)));
+        assert_eq!(PropValue::Number(f64::NAN).to_json_exact(), None);
+        assert_eq!(PropValue::Number(f64::INFINITY).to_json_exact(), None);
     }
 }

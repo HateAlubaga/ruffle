@@ -257,9 +257,10 @@ fn sanitize_stem(stem: &str) -> String {
     let cleaned = cleaned.trim_matches('_');
     let reserved = ["CON", "PRN", "AUX", "NUL"];
     let is_port = |prefix: &str| {
-        cleaned.len() == 4
-            && cleaned[..3].eq_ignore_ascii_case(prefix)
-            && cleaned.as_bytes()[3].is_ascii_digit()
+        let bytes = cleaned.as_bytes();
+        bytes.len() == 4
+            && bytes[..3].eq_ignore_ascii_case(prefix.as_bytes())
+            && bytes[3].is_ascii_digit()
     };
     if cleaned.is_empty()
         || reserved.iter().any(|r| cleaned.eq_ignore_ascii_case(r))
@@ -311,7 +312,19 @@ fn merge_rule(doc: &mut DocumentMut, file: &str, rule: &RuleSpec) -> Result<bool
         .as_table_like_mut()
         .ok_or_else(|| format!("{file}: `set` is not a table"))?;
     for (name, v) in values {
-        set.insert(name, value(v));
+        match set.get_mut(name) {
+            Some(item) => {
+                // Keep the comments around the old value.
+                let decor = item.as_value().map(|old| old.decor().clone());
+                *item = value(v);
+                if let (Some(decor), Some(new)) = (decor, item.as_value_mut()) {
+                    *new.decor_mut() = decor;
+                }
+            }
+            None => {
+                set.insert(name, value(v));
+            }
+        }
     }
     Ok(replaced)
 }
@@ -374,19 +387,12 @@ pub fn remove_rule(dir: &Path, file: &str, rule: &RuleSpec) -> Result<(), String
         .parse()
         .map_err(|e| format!("{file} is not valid TOML: {e}"))?;
     let tables = rule_tables(&mut doc, file)?.ok_or_else(|| format!("{file} has no rules"))?;
-    let before = tables.len();
-    let mut keep = Vec::new();
-    for table in tables.iter() {
-        keep.push(!table_matches(table, rule));
-    }
-    let mut index = 0;
-    tables.retain(|_| {
-        index += 1;
-        keep[index - 1]
-    });
-    if tables.len() == before {
-        return Err(format!("{file} has no such rule (edited meanwhile?)"));
-    }
+    // Only the first match goes: `save_rule` merges into the first match too.
+    let position = tables
+        .iter()
+        .position(|table| table_matches(table, rule))
+        .ok_or_else(|| format!("{file} has no such rule (edited meanwhile?)"))?;
+    tables.remove(position);
     if tables.is_empty() {
         doc.remove("rule");
     }
@@ -600,11 +606,53 @@ mod tests {
     }
 
     #[test]
+    fn remove_deletes_one_of_two_equal_keys() {
+        let tmp = TempDir::new("dupes");
+        let dir = tmp.0.clone();
+        let text = format!(
+            "[mod]\nswf_sha256 = \"{SHA}\"\n\n\
+             [[rule]]\nclass = \"A\"\non = \"create\"\n[rule.set]\nx = 1\n\n\
+             [[rule]]\nclass = \"A\"\non = \"create\"\n[rule.set]\nx = 2\n"
+        );
+        std::fs::write(dir.join("g.toml"), text).unwrap();
+        let a = rule("A", Trigger::Create, &[("x", Json::from(1))]);
+        remove_rule(&dir, "g.toml", &a).unwrap();
+        let file = parsed(&dir, "g.toml");
+        assert_eq!(file.rules.len(), 1);
+        assert!(file.rules[0].set.contains(&("x".into(), Json::from(2))));
+    }
+
+    #[test]
     fn remove_rejects_paths() {
         let tmp = TempDir::new("paths");
+        let dir = tmp.0.join("mods");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         let r = rule("A", Trigger::Create, &[("x", Json::from(1))]);
-        for bad in ["../x.toml", "sub/x.toml", "x.txt", "", "..", "a\\b.toml"] {
-            assert!(remove_rule(&tmp.0, bad, &r).is_err(), "{bad}");
+        let body = format!(
+            "[mod]\nswf_sha256 = \"{SHA}\"\n\n[[rule]]\nclass = \"A\"\non = \"create\"\n[rule.set]\nx = 1\n"
+        );
+        // Real files, each with a matching rule, that the call must not touch.
+        let files = [
+            tmp.0.join("outside.toml"),
+            dir.join("sub").join("x.toml"),
+            dir.join("x.txt"),
+        ];
+        for file in &files {
+            std::fs::write(file, &body).unwrap();
+        }
+        for bad in [
+            "../outside.toml",
+            "sub/x.toml",
+            "x.txt",
+            "",
+            "..",
+            "a\\b.toml",
+        ] {
+            let err = remove_rule(&dir, bad, &r).unwrap_err();
+            assert!(err.contains("is not a mod file name"), "{bad}: {err}");
+        }
+        for file in &files {
+            assert_eq!(std::fs::read_to_string(file).unwrap(), body);
         }
     }
 
@@ -617,6 +665,11 @@ mod tests {
         assert_eq!(sanitize_stem("lpt1"), "swf_lpt1");
         assert_eq!(sanitize_stem("..."), "swf_");
         assert_eq!(sanitize_stem(""), "swf_");
+        // Multi-byte names have a byte length of 4 too; they must not panic.
+        assert_eq!(sanitize_stem("Ку"), "Ку");
+        assert_eq!(sanitize_stem("a日"), "a日");
+        assert_eq!(sanitize_stem("abé"), "abé");
+        assert_eq!(sanitize_stem("Игра"), "Игра");
     }
 
     #[test]
@@ -635,6 +688,34 @@ mod tests {
         std::fs::write(dir.join("b.toml"), "[mod]\nname = \"changed\"\n").unwrap();
         assert_ne!(fingerprint(&dir), before);
         assert!(read_sources(&tmp.0.join("missing")).0.is_empty());
+    }
+
+    /// Rewrites `path` with `bytes` and moves its modification time on, so the
+    /// test does not depend on the file system clock resolution.
+    fn rewrite_later(path: &Path, bytes: &[u8]) {
+        let before = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::fs::write(path, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(before + std::time::Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[test]
+    fn same_size_edits_change_the_fingerprint() {
+        let tmp = TempDir::new("same-size");
+        let path = tmp.0.join("a.toml");
+        std::fs::write(&path, "[mod]\nname = \"aaaa\"\n").unwrap();
+        let before = fingerprint(&tmp.0);
+        rewrite_later(&path, b"[mod]\nname = \"bbbb\"\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before[0].2,
+            "the edit must keep the size"
+        );
+        assert_ne!(fingerprint(&tmp.0), before);
     }
 
     #[test]
@@ -659,5 +740,43 @@ mod tests {
         std::fs::write(&path, b"abcd").unwrap();
         assert_ne!(cache.hash(&path).unwrap(), abc);
         assert!(cache.hash(&tmp.0.join("missing")).is_err());
+    }
+
+    #[test]
+    fn hash_cache_sees_same_size_edits() {
+        let tmp = TempDir::new("hash-same-size");
+        let path = tmp.0.join("a.swf");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut cache = HashCache::default();
+        let abc = cache.hash(&path).unwrap();
+        rewrite_later(&path, b"abd");
+        let abd = cache.hash(&path).unwrap();
+        assert_ne!(abc, abd);
+        // SHA-256("abd")
+        let mut hasher = Sha256::new();
+        hasher.update(b"abd");
+        assert_eq!(abd, format!("{:x}", hasher.finalize()));
+    }
+
+    #[test]
+    fn save_keeps_comments_on_overwritten_values() {
+        let tmp = TempDir::new("value-comments");
+        let dir = tmp.0.clone();
+        let text = format!(
+            "[mod]\nswf_sha256 = \"{SHA}\"\n\n\
+             [[rule]]\nclass = \"Boss\"\non = \"create\"\n[rule.set]\n# the health\nhp = 1 # tail\n"
+        );
+        std::fs::write(dir.join("g.toml"), text).unwrap();
+        let r = rule("Boss", Trigger::Create, &[("hp", Json::from(500))]);
+        assert!(save_rule(&dir, "g", SHA, &r).unwrap().replaced);
+        let text = std::fs::read_to_string(dir.join("g.toml")).unwrap();
+        assert!(text.contains("# the health"), "{text}");
+        assert!(text.contains("# tail"), "{text}");
+        assert!(text.contains("hp = 500"), "{text}");
+        assert!(
+            parsed(&dir, "g.toml").rules[0]
+                .set
+                .contains(&("hp".into(), Json::from(500)))
+        );
     }
 }
