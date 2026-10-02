@@ -15,6 +15,7 @@ pub mod inspect;
 #[cfg(test)]
 mod live_tests;
 pub mod model;
+pub mod mods;
 pub mod speed;
 mod ui;
 
@@ -24,6 +25,7 @@ use crate::debug_ui::handle::DisplayObjectHandle;
 use crate::display_object::{DisplayObject, TDisplayObject};
 use crate::modkit::inspect::Registry;
 use crate::modkit::model::{Access, Change, PropValue, Snapshot, SnapshotLimits};
+use crate::modkit::mods::{RuleSpec, Target, Trigger};
 use gc_arena::DynamicRootSet;
 use ruffle_render::matrix::Matrix;
 use swf::{Color, Twips};
@@ -101,6 +103,17 @@ pub enum HostRequest {
         class_name: String,
         swf_url: String,
     },
+    /// Adds (or merges) a rule into a mod file of the current SWF.
+    SaveRule {
+        rule: RuleSpec,
+    },
+    /// Removes a rule from a mod file.
+    RemoveRule {
+        file: String,
+        rule: RuleSpec,
+    },
+    /// Re-reads the mod files and reinstalls them.
+    ReloadMods,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +126,8 @@ pub enum HostResponse {
         id: u64,
         result: Result<String, String>,
     },
+    /// The mods were (re)installed or a mod file operation finished.
+    Mods(Result<String, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +216,7 @@ enum Tab {
     #[default]
     Inspect,
     Ai,
+    Mods,
     Settings,
 }
 
@@ -231,6 +247,12 @@ pub struct Modkit {
     /// Current and requested player speed; the player syncs these.
     speed: f64,
     speed_request: Option<f64>,
+    /// Trigger used by "Save as rule" buttons.
+    rule_trigger: Trigger,
+    /// Root movie URL the mods were installed for.
+    mods_loaded_for: Option<String>,
+    /// Selected objects should be handed to the new rules.
+    adopt_pending: bool,
 }
 
 impl Modkit {
@@ -265,7 +287,23 @@ impl Modkit {
                     }
                 }
             }
+            HostResponse::Mods(result) => match result {
+                Ok(message) => {
+                    self.status = message;
+                    self.adopt_pending = true;
+                }
+                Err(e) => self.status = format!("Mods: {e}"),
+            },
         }
+    }
+
+    /// URL of the movie the mods were last installed for.
+    pub fn mods_loaded_for(&self) -> Option<&str> {
+        self.mods_loaded_for.as_deref()
+    }
+
+    pub fn set_mods_loaded_for(&mut self, url: Option<String>) {
+        self.mods_loaded_for = url;
     }
 
     pub fn settings(&self) -> &ModkitSettings {
@@ -405,7 +443,11 @@ impl Modkit {
     /// Applies a validated patch as one undo step. Each property is looked
     /// up again first, so a patch never writes a property whose type changed
     /// since the snapshot.
-    fn apply_changes<'gc>(&mut self, activation: &mut Activation<'_, 'gc>, changes: &[Change]) {
+    fn apply_changes<'gc>(
+        &mut self,
+        activation: &mut Activation<'_, 'gc>,
+        changes: &[Change],
+    ) -> Vec<UndoEntry> {
         let mut entries = Vec::new();
         let mut errors = Vec::new();
         for change in changes {
@@ -451,6 +493,7 @@ impl Modkit {
             }
         }
         let applied = entries.len();
+        let done = entries.clone();
         if !entries.is_empty() {
             self.undo.push(UndoBatch {
                 label: format!("AI patch ({applied} changes)"),
@@ -463,6 +506,68 @@ impl Modkit {
         } else {
             format!("Applied {applied} changes; {}", errors.join("; "))
         };
+        done
+    }
+
+    /// Queues rule files for patch entries that were applied: one rule per
+    /// class and target, using the current trigger. Dynamic properties are
+    /// skipped, rules only support declared ones.
+    fn queue_rules_for<'gc>(
+        &mut self,
+        activation: &mut Activation<'_, 'gc>,
+        applied: &[UndoEntry],
+    ) {
+        let dynamic_root = activation.context.dynamic_root;
+        let max_len = self.ai.limits.max_string_len;
+        let mut rules: Vec<RuleSpec> = Vec::new();
+        let mut skipped = 0;
+        for entry in applied {
+            let Some(object) = self.registry.fetch(dynamic_root, entry.id) else {
+                continue;
+            };
+            let Some(class) = inspect::source_class_name(activation, object) else {
+                skipped += 1;
+                continue;
+            };
+            if matches!(entry.access, Access::Dynamic(_)) {
+                skipped += 1;
+                continue;
+            }
+            let target = if object.as_class_object().is_some() {
+                Target::Static
+            } else {
+                Target::Instance
+            };
+            let value = entry.new.to_json(max_len);
+            match rules
+                .iter_mut()
+                .find(|r| r.class == class && r.target == target)
+            {
+                Some(rule) => match rule.set.iter_mut().find(|(name, _)| *name == entry.prop) {
+                    Some(slot) => slot.1 = value,
+                    None => rule.set.push((entry.prop.clone(), value)),
+                },
+                None => rules.push(RuleSpec {
+                    class,
+                    on: self.rule_trigger,
+                    target,
+                    exact: false,
+                    set: vec![(entry.prop.clone(), value)],
+                }),
+            }
+        }
+        let count = rules.len();
+        for rule in rules {
+            self.requests.push(HostRequest::SaveRule { rule });
+        }
+        if skipped > 0 {
+            self.status.push_str(&format!(
+                "; {skipped} not saved as rules (no game class, or dynamic)"
+            ));
+        }
+        if count > 0 {
+            self.status.push_str(&format!("; saving {count} rules"));
+        }
     }
 
     /// Re-applies locked values. Called every UI pass.
@@ -615,11 +720,20 @@ impl Modkit {
     ) {
         if !self.open {
             self.picking = false;
+            self.adopt_pending = false;
             return;
         }
         let domain = context.avm2.stage_domain();
         let mut activation = Activation::from_domain(context, domain);
         self.apply_locks(&mut activation);
+        if std::mem::take(&mut self.adopt_pending) {
+            // Rules just (re)installed: let `every_frame` rules take hold of
+            // the objects being edited, which were created before them.
+            let mc = activation.gc();
+            for object in self.selected_objects(activation.context.dynamic_root) {
+                activation.avm2().mods.adopt(object, mc);
+            }
+        }
         if self.picking {
             self.update_picking(egui_ctx, &mut activation, movie_offset);
         }

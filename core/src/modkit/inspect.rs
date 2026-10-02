@@ -410,6 +410,119 @@ pub fn write_prop<'gc>(
     }
 }
 
+/// A declared property that a mod rule can write, with the value converted.
+pub struct Writable {
+    pub access: Access,
+    pub kind: PropKind,
+    pub value: PropValue,
+    /// Reading the property is free of side effects, so the rule can skip the
+    /// write when the value is already right.
+    pub comparable: bool,
+}
+
+/// The kind a JSON value would have for storage that has no declared type.
+fn kind_of_json(json: &serde_json::Value) -> Option<PropKind> {
+    match json {
+        serde_json::Value::Number(_) => Some(PropKind::Number),
+        serde_json::Value::Bool(_) => Some(PropKind::Boolean),
+        serde_json::Value::String(_) => Some(PropKind::String),
+        _ => None,
+    }
+}
+
+/// Finds the declared property `name` of `object` (a slot, or an accessor
+/// with a setter) and converts `json` for it with the same strict checks as
+/// the object editor. Nothing is called or written.
+///
+/// Dynamic properties are not supported: they exist per instance, so a rule
+/// for a class cannot rely on them.
+pub fn resolve_writable<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    object: Object<'gc>,
+    name: &str,
+    json: &serde_json::Value,
+) -> Result<Writable, String> {
+    let vtable = object.vtable();
+    let found = {
+        let mut public = None;
+        let mut other = None;
+        for (trait_name, ns, prop) in vtable.resolved_traits().iter() {
+            if trait_name.to_string() == name {
+                let slot = if ns.is_public() {
+                    &mut public
+                } else {
+                    &mut other
+                };
+                slot.get_or_insert(*prop);
+            }
+        }
+        public.or(other)
+    };
+    let Some(prop) = found else {
+        return Err(
+            "no such declared property (only declared variables and setters can be set)".into(),
+        );
+    };
+
+    let (access, class, current, comparable) = match prop {
+        Property::Slot { slot_id } => {
+            let class = vtable
+                .slot_class(slot_id)
+                .and_then(|mut c| c.get_class(activation).ok())
+                .flatten();
+            (
+                Access::Slot(slot_id),
+                class,
+                Some(object.get_slot(slot_id)),
+                true,
+            )
+        }
+        Property::ConstSlot { .. } => return Err("property is a constant".into()),
+        Property::Virtual { get, set } => {
+            let Some(set) = set else {
+                return Err("property has no setter".into());
+            };
+            let builtin_getter = get
+                .and_then(|get| vtable.get_method(get))
+                .is_some_and(|getter| {
+                    getter
+                        .translation_unit()
+                        .domain()
+                        .is_playerglobals_domain(activation.avm2())
+                });
+            let class = setter_param_class(activation, object, set);
+            (
+                Access::Accessor {
+                    get: get.unwrap_or(0),
+                    set: Some(set),
+                },
+                class,
+                None,
+                // A game getter may have side effects, so it is never called
+                // just to compare.
+                builtin_getter && get.is_some(),
+            )
+        }
+        _ => return Err("property cannot be set".into()),
+    };
+
+    let kind = if is_untyped(class) {
+        current
+            .and_then(kind_of_value)
+            .or_else(|| kind_of_json(json))
+    } else {
+        class.and_then(kind_of_class)
+    }
+    .ok_or("property type is not a number, string or boolean")?;
+    let value = PropValue::from_json(kind, json)?;
+    Ok(Writable {
+        access,
+        kind,
+        value,
+        comparable,
+    })
+}
+
 /// Snapshots `roots` and, up to `limits.max_depth` levels, the game objects
 /// they reference. Ids come from `registry`, so they stay stable.
 pub fn build_snapshot<'gc>(

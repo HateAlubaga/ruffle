@@ -6,6 +6,7 @@
 use crate::avm2::{Activation, Object};
 use crate::modkit::inspect::{self, ReadProp};
 use crate::modkit::model::{Access, PropEntry, PropValue, describe_changes};
+use crate::modkit::mods::{ModStatus, ModsSnapshot, RuleSpec, Target, Trigger};
 use crate::modkit::{
     AiProvider, AiState, EditRequest, HostRequest, Lock, MAX_SPEED, MIN_SPEED, Modkit, SourceState,
     Tab,
@@ -36,13 +37,32 @@ enum Action<'gc> {
     RejectAi,
     PreviewJson,
     LoadClassNames,
+    SaveRule {
+        class: String,
+        target: Target,
+        prop: String,
+        value: PropValue,
+    },
+    ToggleRule {
+        mod_index: usize,
+        rule_index: usize,
+        enabled: bool,
+    },
+    RemoveRule {
+        file: String,
+        rule: RuleSpec,
+    },
+    ReloadMods,
+    ApplyAiAsRule,
 }
 
 /// One selected object, read for this pass.
 struct ObjectView<'gc> {
     id: u32,
     label: String,
-    has_source: bool,
+    /// Nearest game class: the class of a rule saved from this object.
+    source_class: Option<String>,
+    is_static: bool,
     props: Vec<ReadProp<'gc>>,
 }
 
@@ -60,6 +80,7 @@ impl Modkit {
         } else {
             vec![]
         };
+        let mods = (self.tab == Tab::Mods).then(|| activation.avm2().mods.snapshot());
         let mut actions = Vec::new();
         let mut open = self.open;
         Window::new("Modkit")
@@ -71,6 +92,7 @@ impl Modkit {
                 match self.tab {
                     Tab::Inspect => self.show_inspect(ui, &views, &mut actions),
                     Tab::Ai => self.show_ai(ui, &mut actions),
+                    Tab::Mods => self.show_mods(ui, mods.as_ref(), &mut actions),
                     Tab::Settings => self.show_settings(ui),
                 }
                 if !self.status.is_empty() {
@@ -102,7 +124,8 @@ impl Modkit {
             views.push(ObjectView {
                 id,
                 label,
-                has_source: inspect::source_class_name(activation, object).is_some(),
+                source_class: inspect::source_class_name(activation, object),
+                is_static: object.as_class_object().is_some(),
                 props: inspect::read_props(activation, object),
             });
         }
@@ -113,6 +136,7 @@ impl Modkit {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Inspect, "Inspect");
             ui.selectable_value(&mut self.tab, Tab::Ai, "AI edit");
+            ui.selectable_value(&mut self.tab, Tab::Mods, "Mods");
             ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
         });
         ui.horizontal(|ui| {
@@ -219,6 +243,19 @@ impl Modkit {
             ui.weak("Nothing selected. Use Pick, or add a class for its static vars.");
             return;
         }
+        ui.horizontal(|ui| {
+            ui.label("Save as rule:");
+            ui.radio_value(&mut self.rule_trigger, Trigger::Create, "on create")
+                .on_hover_text("Apply right after the constructor of the class has finished");
+            ui.radio_value(&mut self.rule_trigger, Trigger::FirstFrame, "first frame")
+                .on_hover_text(
+                    "Apply once, when the frame in which the object was created ends. \
+                     Use it when the game sets its values up after the constructor, \
+                     for example when the object is added to the stage",
+                );
+            ui.radio_value(&mut self.rule_trigger, Trigger::EveryFrame, "every frame")
+                .on_hover_text("Keep the value, every frame");
+        });
 
         self.hovered = None;
         ScrollArea::vertical()
@@ -230,7 +267,7 @@ impl Modkit {
                         .default_open(true)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                if view.has_source {
+                                if view.source_class.is_some() {
                                     if ui.small_button("Show class source").clicked() {
                                         actions.push(Action::ShowSource(view.id));
                                     }
@@ -254,7 +291,7 @@ impl Modkit {
     fn show_props<'gc>(&self, ui: &mut Ui, view: &ObjectView<'gc>, actions: &mut Vec<Action<'gc>>) {
         Grid::new(("modkit_props", view.id))
             .striped(true)
-            .num_columns(3)
+            .num_columns(4)
             .show(ui, |ui| {
                 for ReadProp { entry, target } in &view.props {
                     if entry.builtin && !self.show_builtin {
@@ -288,7 +325,148 @@ impl Modkit {
                     } else {
                         ui.label("");
                     }
+                    let rule_value = match (&view.source_class, &entry.value) {
+                        (Some(class), Some(value))
+                            if entry.is_editable()
+                                && !entry.builtin
+                                && !matches!(entry.access, Access::Dynamic(_)) =>
+                        {
+                            Some((class, value))
+                        }
+                        _ => None,
+                    };
+                    if let Some((class, value)) = rule_value {
+                        if ui
+                            .small_button("rule")
+                            .on_hover_text(format!(
+                                "Save {} = {} as a rule ({}) of class {class}",
+                                entry.name,
+                                value.to_json(self.ai.limits.max_string_len),
+                                self.rule_trigger.name(),
+                            ))
+                            .clicked()
+                        {
+                            actions.push(Action::SaveRule {
+                                class: class.clone(),
+                                target: if view.is_static {
+                                    Target::Static
+                                } else {
+                                    Target::Instance
+                                },
+                                prop: entry.name.clone(),
+                                value: value.clone(),
+                            });
+                        }
+                    } else {
+                        ui.label("");
+                    }
                     ui.end_row();
+                }
+            });
+    }
+
+    fn show_mods<'gc>(
+        &mut self,
+        ui: &mut Ui,
+        snapshot: Option<&ModsSnapshot>,
+        actions: &mut Vec<Action<'gc>>,
+    ) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .button("Reload files")
+                .on_hover_text("Read the .toml files again and apply them")
+                .clicked()
+            {
+                actions.push(Action::ReloadMods);
+            }
+            ui.weak(format!("{} objects kept in sync", snapshot.tracked));
+        });
+        if snapshot.overflowed {
+            ui.colored_label(
+                Color32::YELLOW,
+                "Too many objects with every_frame rules: new ones are ignored",
+            );
+        }
+        if !snapshot.dir.is_empty() {
+            ui.weak(format!("Folder: {}", snapshot.dir));
+        }
+        if let Some(hash) = &snapshot.swf_sha256 {
+            ui.weak(format!("SWF sha256: {hash}"));
+        }
+        if snapshot.mods.is_empty() {
+            ui.weak(
+                "No mods for this SWF. Use the \"rule\" button in the Inspect tab, \
+                 or put a .toml file in the folder.",
+            );
+            return;
+        }
+        ScrollArea::vertical()
+            .id_salt("modkit_mods_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (mod_index, info) in snapshot.mods.iter().enumerate() {
+                    let state = match &info.status {
+                        ModStatus::Active => "",
+                        ModStatus::Disabled => " (disabled)",
+                        ModStatus::OtherSwf => " (other SWF)",
+                        ModStatus::Invalid(_) => " (invalid)",
+                    };
+                    CollapsingHeader::new(format!("{}{state}", info.name))
+                        .id_salt(("modkit_mod", &info.file))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.weak(&info.file);
+                            if !info.description.is_empty() {
+                                ui.label(&info.description);
+                            }
+                            if let ModStatus::Invalid(message) = &info.status {
+                                ui.colored_label(Color32::LIGHT_RED, message);
+                            }
+                            for (rule_index, rule) in info.rules.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let mut enabled = rule.enabled;
+                                    if ui
+                                        .checkbox(&mut enabled, "")
+                                        .on_hover_text("Pause this rule until the next reload")
+                                        .changed()
+                                    {
+                                        actions.push(Action::ToggleRule {
+                                            mod_index,
+                                            rule_index,
+                                            enabled,
+                                        });
+                                    }
+                                    let spec = &rule.spec;
+                                    let exact = if spec.exact { ", exact" } else { "" };
+                                    ui.label(format!(
+                                        "{} [{} {}{exact}] {}",
+                                        spec.class,
+                                        spec.on.name(),
+                                        spec.target.name(),
+                                        spec.describe_set(),
+                                    ));
+                                    if ui
+                                        .small_button("✖")
+                                        .on_hover_text("Remove the rule from the file")
+                                        .clicked()
+                                    {
+                                        actions.push(Action::RemoveRule {
+                                            file: info.file.clone(),
+                                            rule: spec.clone(),
+                                        });
+                                    }
+                                });
+                                if rule.applied > 0 {
+                                    ui.weak(format!("    applied {} times", rule.applied));
+                                }
+                                for error in &rule.errors {
+                                    ui.colored_label(Color32::LIGHT_RED, format!("    {error}"));
+                                }
+                            }
+                        });
                 }
             });
     }
@@ -482,6 +660,15 @@ impl Modkit {
                     if ui.add_enabled(any, egui::Button::new("Apply")).clicked() {
                         actions.push(Action::ApplyAi);
                     }
+                    if ui
+                        .add_enabled(any, egui::Button::new("Apply & save as rule"))
+                        .on_hover_text(
+                            "Also keep the changes in a mod file (trigger from the Inspect tab)",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ApplyAiAsRule);
+                    }
                     if ui.button("Reject").clicked() {
                         actions.push(Action::RejectAi);
                     }
@@ -609,6 +796,7 @@ impl Modkit {
         pass: u64,
     ) {
         let dynamic_root = activation.context.dynamic_root;
+        let as_rule = matches!(action, Action::ApplyAiAsRule);
         match action {
             Action::Edit(edit) => self.edit(activation, edit, Some(pass)),
             Action::ToggleLock {
@@ -663,7 +851,7 @@ impl Modkit {
             Action::Undo => self.undo(activation),
             Action::StartAi => self.start_ai_request(activation),
             Action::CancelAi | Action::RejectAi => self.ai.state = AiState::Idle,
-            Action::ApplyAi => {
+            Action::ApplyAi | Action::ApplyAiAsRule => {
                 if let AiState::Review {
                     changes, enabled, ..
                 } = std::mem::take(&mut self.ai.state)
@@ -673,9 +861,41 @@ impl Modkit {
                         .zip(enabled)
                         .filter_map(|(c, on)| on.then_some(c))
                         .collect();
-                    self.apply_changes(activation, &chosen);
+                    let applied = self.apply_changes(activation, &chosen);
+                    if as_rule {
+                        self.queue_rules_for(activation, &applied);
+                    }
                 }
             }
+            Action::SaveRule {
+                class,
+                target,
+                prop,
+                value,
+            } => {
+                let value = value.to_json(self.ai.limits.max_string_len);
+                self.requests.push(HostRequest::SaveRule {
+                    rule: RuleSpec {
+                        class,
+                        on: self.rule_trigger,
+                        target,
+                        exact: false,
+                        set: vec![(prop, value)],
+                    },
+                });
+            }
+            Action::ToggleRule {
+                mod_index,
+                rule_index,
+                enabled,
+            } => activation
+                .avm2()
+                .mods
+                .set_rule_enabled(mod_index, rule_index, enabled),
+            Action::RemoveRule { file, rule } => {
+                self.requests.push(HostRequest::RemoveRule { file, rule });
+            }
+            Action::ReloadMods => self.requests.push(HostRequest::ReloadMods),
             Action::PreviewJson => {
                 let roots = self.selected_objects(dynamic_root);
                 let snapshot = inspect::build_snapshot(

@@ -397,7 +397,7 @@ impl<'gc> ClassObject<'gc> {
                 None
             };
 
-            exec(
+            let result = exec(
                 method,
                 scope,
                 receiver,
@@ -405,7 +405,14 @@ impl<'gc> ClassObject<'gc> {
                 arguments,
                 activation,
                 callee,
-            )
+            );
+
+            #[cfg(feature = "modkit")]
+            if result.is_ok() {
+                crate::modkit::mods::on_constructed(self, receiver, activation);
+            }
+
+            result
         } else {
             unreachable!("Cannot instantiate a class without an init method")
         }

@@ -57,6 +57,7 @@ scopeguard = "1.2.0"
 fluent-templates = { workspace = true }
 egui = { workspace = true, optional = true }
 egui_extras = { workspace = true, default-features = false, optional = true }
+toml = { workspace = true, optional = true }
 png = { workspace = true, optional = true }
 flv-rs = { path = "../flv" }
 async-channel = { workspace = true }
@@ -92,7 +93,7 @@ known_stubs = ["linkme", "serde"]
 default_compatibility_rules = []
 egui = ["dep:egui", "dep:egui_extras", "png"]
 # Ruffle Modkit: live game editing tools (fork-only).
-modkit = ["egui"]
+modkit = ["egui", "dep:toml"]
 jpegxr = ["dep:jpegxr", "ruffle_render/jpegxr", "lzma"]
 default_font = []
 serde = ["serde/derive"]

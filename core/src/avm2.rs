@@ -191,6 +191,10 @@ pub struct Avm2<'gc> {
     pub debug_output: bool,
 
     pub optimizer_enabled: bool,
+
+    /// Overlay mods of the Ruffle Modkit.
+    #[cfg(feature = "modkit")]
+    pub(crate) mods: crate::modkit::mods::ModRuntime<'gc>,
 }
 
 impl<'gc> Avm2<'gc> {
@@ -241,6 +245,9 @@ impl<'gc> Avm2<'gc> {
             debug_output: false,
 
             optimizer_enabled: true,
+
+            #[cfg(feature = "modkit")]
+            mods: Default::default(),
         }
     }
 

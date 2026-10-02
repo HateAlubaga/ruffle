@@ -132,11 +132,12 @@ fn is_jar(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
 }
 
-fn swf_path(swf_url: &str) -> Result<PathBuf, String> {
+/// The file a movie URL points to, if the movie was loaded from disk.
+pub(super) fn swf_path(swf_url: &str) -> Result<PathBuf, String> {
     let url = Url::parse(swf_url).map_err(|e| format!("Bad movie URL {swf_url}: {e}"))?;
     if url.scheme() != "file" {
         return Err(
-            "FFDec needs a local SWF file; this movie was loaded from the network.".to_string(),
+            "this movie was loaded from the network, not from a local SWF file".to_string(),
         );
     }
     url.to_file_path()

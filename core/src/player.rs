@@ -667,6 +667,23 @@ impl Player {
         self.speed.set(factor, self.audio.as_mut());
     }
 
+    /// Replaces the mods of the running game: rules read from mod files by the
+    /// frontend. `root_url` is the URL the frontend loaded the game from (the
+    /// player cannot tell before the movie has finished loading) and
+    /// `swf_sha256` is the hash of that file, if known.
+    #[cfg(feature = "modkit")]
+    pub fn install_mods(
+        &mut self,
+        sources: Vec<crate::modkit::mods::ModSource>,
+        swf_sha256: Option<String>,
+        root_url: String,
+        dir: String,
+    ) {
+        self.mutate_with_update_context(|context| {
+            crate::modkit::mods::install(context, sources, swf_sha256, root_url, dir);
+        });
+    }
+
     pub fn is_playing(&self) -> bool {
         match self.run_state {
             RunState::Playing | RunState::Stepping => true,
@@ -2107,6 +2124,8 @@ impl Player {
         self.update(|context| {
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
+            #[cfg(feature = "modkit")]
+            crate::modkit::mods::run_frame(context);
             Avm1::run_frame(context);
             AudioManager::update_sounds(context);
             LocalConnections::update_connections(context);

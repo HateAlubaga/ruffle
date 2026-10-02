@@ -208,6 +208,8 @@ impl ActivePlayer {
             player_id,
         };
         let movie_url = content.initial_swf_url().clone();
+        #[cfg(feature = "modkit")]
+        let config_dir = preferences.cli.config.clone();
         let readable_name = content.name();
         let initial_allow_list = PathAllowList::new(content_descriptor);
         let navigator = ExternalNavigatorBackend::new(
@@ -357,6 +359,8 @@ impl ActivePlayer {
                 opt.player.parameters.to_owned(),
                 Box::new(on_metadata),
             );
+            #[cfg(feature = "modkit")]
+            crate::modkit::install_initial(&mut player_lock, &config_dir, movie_url.as_str());
 
             player_lock.set_default_font(
                 DefaultFont::Serif,

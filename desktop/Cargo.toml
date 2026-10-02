@@ -34,6 +34,7 @@ webbrowser = "1.2.4"
 url = { workspace = true }
 reqwest = { workspace = true, optional = true, features = ["json"] }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 dirs = "6.0"
 rfd = { workspace = true }
 anyhow = { workspace = true }
@@ -100,7 +101,7 @@ fontconfig-dlopen = ["fontconfig", "fontconfig/dlopen"]
 freetype = ["ruffle_frontend_utils/freetype"]
 
 # Ruffle Modkit: live game editing tools (fork-only).
-modkit = ["ruffle_core/modkit", "dep:reqwest", "dep:serde_json"]
+modkit = ["ruffle_core/modkit", "dep:reqwest", "dep:serde_json", "dep:sha2"]
 
 # wgpu features
 render_debug_labels = ["ruffle_render_wgpu/render_debug_labels"]
