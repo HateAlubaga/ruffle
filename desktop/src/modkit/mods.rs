@@ -24,10 +24,13 @@ pub fn mods_dir(config_dir: &Path) -> PathBuf {
 // Hashing the SWF
 // ---------------------------------------------------------------------------
 
+/// What identifies a file's content cheaply: path, modification time, size.
+type FileKey = (PathBuf, Option<SystemTime>, u64);
+
 /// SHA-256 of a file, remembered until the file changes.
 #[derive(Default)]
 pub struct HashCache {
-    cached: Option<((PathBuf, Option<SystemTime>, u64), String)>,
+    cached: Option<(FileKey, String)>,
 }
 
 impl HashCache {
@@ -400,6 +403,7 @@ pub fn remove_rule(dir: &Path, file: &str, rule: &RuleSpec) -> Result<(), String
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use ruffle_core::modkit::mods::{Target, Trigger, parse_mod};
