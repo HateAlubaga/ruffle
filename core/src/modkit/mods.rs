@@ -444,20 +444,49 @@ struct LoadedMod {
 enum PropState {
     Unresolved,
     Ready {
-        access: Access,
-        value: PropValue,
-        /// Skip the write when the property already holds the value.
-        compare: Option<PropKind>,
-        /// Writes that failed in a row. A write can fail for a reason that
-        /// passes (a setter that throws on some frames), so one failure does
-        /// not end the rule; `MAX_WRITE_FAILURES` in a row do.
+        /// Behind an `Rc`, so cloning the state never copies strings.
+        data: Rc<ReadyProp>,
+        /// Frames with a failed write in a row. A write can fail for a reason
+        /// that passes (a setter that throws on some frames), so one failure
+        /// does not end the rule; `MAX_WRITE_FAILURES` in a row do.
         failures: u8,
+        /// Frame of the last counted failure (`u64::MAX`: none yet).
+        last_failure_frame: u64,
     },
     /// Cannot be applied; the reason is in the rule's errors.
     Dead,
 }
 
-/// A property that fails this many writes in a row is given up.
+/// How to write one resolved property.
+struct ReadyProp {
+    access: Access,
+    value: PropValue,
+    /// Skip the write when the property already holds the value.
+    compare: Option<PropKind>,
+}
+
+impl PropState {
+    /// Counts a failed write, at most once per frame: the state is shared by
+    /// all instances of the class. Returns whether to give the property up.
+    fn note_failure(&mut self, frame: u64) -> bool {
+        match self {
+            PropState::Ready {
+                failures,
+                last_failure_frame,
+                ..
+            } => {
+                if *last_failure_frame != frame {
+                    *last_failure_frame = frame;
+                    *failures += 1;
+                }
+                *failures >= MAX_WRITE_FAILURES
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A property whose writes fail in this many frames in a row is given up.
 const MAX_WRITE_FAILURES: u8 = 20;
 
 /// A rule together with what was learned about its properties. Properties
@@ -517,6 +546,8 @@ pub struct ModRuntime<'gc> {
     pending: Vec<Tracked<'gc>>,
     statics: Vec<StaticRule<'gc>>,
     frame: u64,
+    /// `frame + 1` of the last prune of a full `tracked` list (0: never).
+    pruned_at: u64,
     overflowed: bool,
     /// URL of the root movie the mods were installed for.
     #[collect(require_static)]
@@ -583,7 +614,7 @@ impl<'gc> ModRuntime<'gc> {
         self.instance_rules.clear();
         self.plans.clear();
         self.statics.clear();
-        self.pending.clear();
+        let old_pending = std::mem::take(&mut self.pending);
         self.overflowed = false;
 
         for source in sources {
@@ -615,6 +646,15 @@ impl<'gc> ModRuntime<'gc> {
                 self.track(object, mc);
             }
         }
+        // Objects still waiting for their `first_frame` rules keep waiting.
+        for waiting in old_pending {
+            if let Some(object) = waiting.object.upgrade(mc)
+                && let Some(plan) = self.plan_for(object.instance_class(), mc)
+                && plan.has_first_frame
+            {
+                self.defer_first_frame(object, &plan);
+            }
+        }
     }
 
     fn plan_for(&mut self, class: Class<'gc>, mc: &Mutation<'gc>) -> Option<Rc<Plan>> {
@@ -634,6 +674,11 @@ impl<'gc> ModRuntime<'gc> {
     fn track(&mut self, object: Object<'gc>, mc: &Mutation<'gc>) -> Option<Rc<Plan>> {
         let plan = self.plan_for(object.instance_class(), mc)?;
         if plan.has_every_frame {
+            // A full list may hold dead objects; drop them, once per frame.
+            if self.tracked.len() >= MAX_TRACKED && self.pruned_at != self.frame + 1 {
+                self.pruned_at = self.frame + 1;
+                self.tracked.retain(|t| t.object.upgrade(mc).is_some());
+            }
             if self.tracked.len() >= MAX_TRACKED {
                 self.overflowed = true;
             } else {
@@ -734,19 +779,6 @@ impl<'gc> ModRuntime<'gc> {
             .filter_map(|t| Some((t.object.upgrade(mc)?, t.plan)))
             .collect()
     }
-
-    /// The live tracked objects, dropping the dead ones.
-    fn live_tracked(&mut self, mc: &Mutation<'gc>) -> Vec<(Object<'gc>, Rc<Plan>)> {
-        let mut live = Vec::with_capacity(self.tracked.len());
-        self.tracked.retain(|t| match t.object.upgrade(mc) {
-            Some(object) => {
-                live.push((object, t.plan.clone()));
-                true
-            }
-            None => false,
-        });
-        live
-    }
 }
 
 fn load_mod(source: ModSource, swf_sha256: Option<&str>) -> LoadedMod {
@@ -805,10 +837,13 @@ fn apply_prop<'gc>(
         PropState::Unresolved => {
             let resolved = match inspect::resolve_writable(activation, object, name, json) {
                 Ok(w) => PropState::Ready {
-                    access: w.access,
-                    value: w.value,
-                    compare: w.comparable.then_some(w.kind),
+                    data: Rc::new(ReadyProp {
+                        access: w.access,
+                        value: w.value,
+                        compare: w.comparable.then_some(w.kind),
+                    }),
                     failures: 0,
+                    last_failure_frame: u64::MAX,
                 },
                 Err(e) => {
                     rule.note_error(format!("{name}: {e}"));
@@ -820,22 +855,17 @@ fn apply_prop<'gc>(
         }
         other => other,
     };
-    let PropState::Ready {
-        access,
-        value,
-        compare,
-        failures,
-    } = state
-    else {
+    let PropState::Ready { data, failures, .. } = state else {
         return;
     };
+    let (access, value) = (&data.access, &data.value);
 
-    if let Some(kind) = compare
-        && inspect::read_prop(activation, object, &access, kind).as_ref() == Ok(&value)
+    if let Some(kind) = data.compare
+        && inspect::read_prop(activation, object, access, kind).as_ref() == Ok(value)
     {
         return;
     }
-    match inspect::write_prop(activation, object, &access, &value) {
+    match inspect::write_prop(activation, object, access, value) {
         Ok(()) => {
             rule.applied.set(rule.applied.get() + 1);
             if failures > 0
@@ -846,15 +876,9 @@ fn apply_prop<'gc>(
         }
         Err(e) => {
             rule.note_error(format!("{name}: {e}"));
+            let frame = activation.avm2().mods.frame;
             let mut props = entry.props.borrow_mut();
-            let dead = match &mut props[index] {
-                PropState::Ready { failures, .. } => {
-                    *failures += 1;
-                    *failures >= MAX_WRITE_FAILURES
-                }
-                _ => false,
-            };
-            if dead {
+            if props[index].note_failure(frame) {
                 props[index] = PropState::Dead;
             }
         }
@@ -921,15 +945,31 @@ pub(crate) fn run_frame<'gc>(context: &mut UpdateContext<'gc>) {
     mods.frame += 1;
     let frame = mods.frame;
     let pending = mods.take_pending(mc);
-    let tracked = mods.live_tracked(mc);
+    // Taken out for the loop: rules call into AVM2, which can track objects.
+    let mut tracked = std::mem::take(&mut mods.tracked);
 
     let domain = context.avm2.stage_domain();
     let mut activation = Activation::from_domain(context, domain);
     for (object, plan) in &pending {
         apply_plan(&mut activation, *object, plan, Trigger::FirstFrame);
     }
-    for (object, plan) in &tracked {
-        apply_plan(&mut activation, *object, plan, Trigger::EveryFrame);
+    tracked.retain(|t| match t.object.upgrade(mc) {
+        Some(object) => {
+            apply_plan(&mut activation, object, &t.plan, Trigger::EveryFrame);
+            true
+        }
+        None => false,
+    });
+    // Put the list back, followed by the objects tracked during the loop.
+    let mods = &mut activation.avm2().mods;
+    let added = std::mem::replace(&mut mods.tracked, tracked);
+    let room = MAX_TRACKED.saturating_sub(mods.tracked.len());
+    if added.len() > room {
+        mods.overflowed = true;
+    }
+    mods.tracked.extend(added.into_iter().take(room));
+    if mods.tracked.len() < MAX_TRACKED && mods.pending.len() < MAX_TRACKED {
+        mods.overflowed = false;
     }
 
     for index in 0..activation.avm2().mods.statics.len() {
@@ -1187,6 +1227,29 @@ mod tests {
         assert!(!matches("other.Boss", false));
         assert!(!matches("Boss4", false));
         assert!(!ActiveRule::new(rule("Boss", false)).matches_chain(&[]));
+    }
+
+    #[test]
+    fn write_failures_count_once_per_frame() {
+        let mut state = PropState::Ready {
+            data: Rc::new(ReadyProp {
+                access: Access::ConstSlot(0),
+                value: PropValue::Int(1),
+                compare: None,
+            }),
+            failures: 0,
+            last_failure_frame: u64::MAX,
+        };
+        // Many instances failing in one frame count as one failure.
+        for _ in 0..100 {
+            assert!(!state.note_failure(0));
+        }
+        for frame in 1..u64::from(MAX_WRITE_FAILURES) - 1 {
+            assert!(!state.note_failure(frame));
+        }
+        assert!(state.note_failure(u64::from(MAX_WRITE_FAILURES)));
+        assert!(!PropState::Unresolved.note_failure(0));
+        assert!(!PropState::Dead.note_failure(0));
     }
 
     #[test]

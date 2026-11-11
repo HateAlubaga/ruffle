@@ -5,7 +5,7 @@
 
 use crate::avm2::{Activation, Object};
 use crate::modkit::inspect::{self, ReadProp};
-use crate::modkit::model::{Access, PropEntry, PropValue, describe_changes};
+use crate::modkit::model::{Access, PropEntry, PropValue};
 use crate::modkit::mods::{ModStatus, ModsSnapshot, RuleSpec, Target, Trigger};
 use crate::modkit::{
     AiProvider, AiState, EditRequest, HostRequest, Lock, MAX_SPEED, MIN_SPEED, Modkit, SourceState,
@@ -127,7 +127,7 @@ impl Modkit {
                 label,
                 source_class: inspect::source_class_name(activation, object),
                 is_static: object.as_class_object().is_some(),
-                props: inspect::read_props(activation, object),
+                props: inspect::read_props(activation, object, self.show_builtin),
             });
         }
         views
@@ -180,7 +180,7 @@ impl Modkit {
             if undo.clicked() {
                 actions.push(Action::Undo);
             }
-            let edits = self.session_edits().len();
+            let edits = self.edit_count;
             if ui
                 .add_enabled(
                     edits > 0,
@@ -233,7 +233,8 @@ impl Modkit {
                     .hint_text("Class for static vars, e.g. Stats")
                     .desired_width(200.0),
             );
-            if response.gained_focus() && self.class_names.is_none() {
+            // Every time: classes can be defined after the first load.
+            if response.gained_focus() {
                 actions.push(Action::LoadClassNames);
             }
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -247,7 +248,8 @@ impl Modkit {
             let needle = self.class_input.to_ascii_lowercase();
             let matches: Vec<&String> = names
                 .iter()
-                .filter(|n| n.to_ascii_lowercase().contains(&needle) && **n != self.class_input)
+                .filter(|(n, lower)| lower.contains(&needle) && *n != self.class_input)
+                .map(|(n, _)| n)
                 .take(8)
                 .collect();
             if !matches.is_empty() {
@@ -665,8 +667,8 @@ impl Modkit {
                 }
             }
             AiState::Review {
-                snapshot,
                 changes,
+                lines,
                 enabled,
                 raw,
             } => {
@@ -674,7 +676,6 @@ impl Modkit {
                     ui.label("The AI proposed no changes.");
                 } else {
                     ui.strong("Proposed changes");
-                    let lines = describe_changes(changes, snapshot);
                     ScrollArea::vertical()
                         .id_salt("modkit_ai_diff")
                         .max_height(240.0)
@@ -854,8 +855,15 @@ impl Modkit {
                 let id = self.registry.id_for(activation.context, object);
                 self.select(id, true);
             }
-            Action::Remove(id) => self.selection.retain(|s| *s != id),
-            Action::ClearSelection => self.selection.clear(),
+            // Locks go with the selection: there is no other way to release them.
+            Action::Remove(id) => {
+                self.selection.retain(|s| *s != id);
+                self.locks.retain(|l| l.id != id);
+            }
+            Action::ClearSelection => {
+                self.selection.clear();
+                self.locks.clear();
+            }
             Action::ShowSource(id) => {
                 if let Some(object) = self.registry.fetch(dynamic_root, id) {
                     self.request_source(activation, object);
@@ -880,7 +888,15 @@ impl Modkit {
                 None => self.status = format!("No game class named {name:?}"),
             },
             Action::LoadClassNames => {
-                self.class_names = Some(inspect::game_class_names(activation));
+                self.class_names = Some(
+                    inspect::game_class_names(activation)
+                        .into_iter()
+                        .map(|name| {
+                            let lower = name.to_ascii_lowercase();
+                            (name, lower)
+                        })
+                        .collect(),
+                );
             }
             Action::Undo => self.undo(activation),
             Action::StartAi => self.start_ai_request(activation),

@@ -114,29 +114,52 @@ struct OpenAiCompatible {
 
 impl LlmProvider for OpenAiCompatible {
     fn complete(&self, system: String, user: String) -> CompletionFuture {
-        let body = json!({
-            "model": self.model,
-            "temperature": 0,
-            "max_tokens": MAX_TOKENS,
-            // Some gateways stream unless told not to.
-            "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        });
-        let mut request = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
+        let client = self.client.clone();
+        let url = format!("{}/chat/completions", self.base_url);
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
         Box::pin(async move {
-            let text = send(request).await?;
+            let request = |legacy: bool| {
+                let body = openai_body(&model, &system, &user, legacy);
+                let mut request = client.post(url.as_str()).json(&body);
+                if let Some(key) = &api_key {
+                    request = request.bearer_auth(key);
+                }
+                request
+            };
+            let text = match send(request(true)).await {
+                Err(e) if rejects_legacy_params(&e) => send(request(false)).await?,
+                other => other?,
+            };
             openai_reply(&text)
         })
     }
+}
+
+/// `legacy` is the classic parameter set; newer OpenAI models only take
+/// `max_completion_tokens` and the default temperature.
+fn openai_body(model: &str, system: &str, user: &str, legacy: bool) -> Value {
+    let mut body = json!({
+        "model": model,
+        // Some gateways stream unless told not to.
+        "stream": false,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    });
+    if legacy {
+        body["temperature"] = json!(0);
+        body["max_tokens"] = json!(MAX_TOKENS);
+    } else {
+        body["max_completion_tokens"] = json!(MAX_TOKENS);
+    }
+    body
+}
+
+/// Whether an error from `send` is a model refusing the legacy parameters.
+fn rejects_legacy_params(error: &str) -> bool {
+    error.starts_with("HTTP 400") && (error.contains("max_tokens") || error.contains("temperature"))
 }
 
 /// Parses a `/chat/completions` reply. A server that ignores `"stream": false`
@@ -286,6 +309,24 @@ mod tests {
         assert!(openai_reply(r#"data: {"error":{"message":"nope"}}"#).is_err());
         assert!(openai_reply("data: [DONE]\n\n").is_err());
         assert!(openai_reply("not json").is_err());
+    }
+
+    #[test]
+    fn openai_body_variants() {
+        let legacy = openai_body("m", "s", "u", true);
+        assert_eq!(legacy["max_tokens"], json!(MAX_TOKENS));
+        assert_eq!(legacy["temperature"], json!(0));
+        let modern = openai_body("m", "s", "u", false);
+        assert_eq!(modern["max_completion_tokens"], json!(MAX_TOKENS));
+        assert!(modern.get("max_tokens").is_none());
+        assert!(modern.get("temperature").is_none());
+        assert_eq!(modern["messages"][1]["content"], json!("u"));
+
+        assert!(rejects_legacy_params(
+            "HTTP 400 Bad Request: Unsupported parameter: 'max_tokens'"
+        ));
+        assert!(!rejects_legacy_params("HTTP 401 Unauthorized: max_tokens"));
+        assert!(!rejects_legacy_params("HTTP 400 Bad Request: bad model"));
     }
 
     #[test]

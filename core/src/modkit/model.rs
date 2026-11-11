@@ -283,11 +283,13 @@ impl Snapshot {
     /// type; everything else is marked read-only.
     pub fn to_llm_json(&self, limits: &SnapshotLimits) -> String {
         let mut objects = Vec::new();
-        let mut size = 0;
+        // Room for the `{"objects":[],"truncated":true}` wrapper.
+        let mut size = 32;
         let mut truncated = self.truncated;
         for object in self.objects.iter().take(limits.max_objects) {
             let json = object_to_json(object, limits, &mut truncated);
-            let len = json.to_string().len();
+            // Plus the separating comma.
+            let len = json.to_string().len() + 1;
             if size + len > limits.max_json_bytes {
                 truncated = true;
                 break;
@@ -303,7 +305,8 @@ impl Snapshot {
         if truncated {
             root.insert("truncated".into(), Json::Bool(true));
         }
-        serde_json::to_string_pretty(&Json::Object(root)).unwrap_or_default()
+        // Compact, so the size check above matches what is returned.
+        serde_json::to_string(&Json::Object(root)).unwrap_or_default()
     }
 }
 
@@ -371,13 +374,11 @@ pub const MAX_PATCH_CHANGES: usize = 500;
 /// property, type mismatch, duplicate or extra key rejects the whole patch
 /// and every problem found is returned.
 pub fn parse_patch(text: &str, snapshot: &Snapshot) -> Result<Vec<Change>, Vec<String>> {
-    let json_text = extract_json_array(text).ok_or_else(|| {
-        vec!["response contains no JSON array (expected [{\"id\":..,\"set\":{..}}])".to_string()]
-    })?;
-    let json: Json =
-        serde_json::from_str(json_text).map_err(|e| vec![format!("invalid JSON: {e}")])?;
-    let Json::Array(entries) = json else {
-        return Err(vec!["patch must be a JSON array".to_string()]);
+    let Some(Json::Array(entries)) = extract_json_array(text) else {
+        return Err(vec![
+            "response contains no valid JSON array (expected [{\"id\":..,\"set\":{..}}])"
+                .to_string(),
+        ]);
     };
 
     let mut errors = Vec::new();
@@ -446,12 +447,26 @@ pub fn parse_patch(text: &str, snapshot: &Snapshot) -> Result<Vec<Change>, Vec<S
     }
 }
 
-/// LLMs like to wrap JSON in prose or code fences. Take the outermost
-/// `[...]` and let the JSON parser decide whether it is valid.
-fn extract_json_array(text: &str) -> Option<&str> {
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    (end > start).then(|| &text[start..=end])
+/// LLMs like to wrap JSON in prose or code fences. Try every `[` and take
+/// the first array that looks like a patch (non-empty, objects only); fall
+/// back to the first array that parses at all.
+fn extract_json_array(text: &str) -> Option<Json> {
+    let mut first = None;
+    for (i, _) in text.match_indices('[') {
+        let mut stream = serde_json::Deserializer::from_str(&text[i..]).into_iter::<Json>();
+        if let Some(Ok(value)) = stream.next() {
+            let Some(entries) = value.as_array() else {
+                continue;
+            };
+            if !entries.is_empty() && entries.iter().all(Json::is_object) {
+                return Some(value);
+            }
+            if first.is_none() {
+                first = Some(value);
+            }
+        }
+    }
+    first
 }
 
 pub const SYSTEM_PROMPT: &str = "You edit a running Flash (ActionScript 3) game.
@@ -594,6 +609,35 @@ mod tests {
     }
 
     #[test]
+    fn accepts_patch_surrounded_by_bracketed_prose() {
+        let s = snapshot();
+        for text in [
+            "Changed hp [was 100]:
+[{\"id\":1,\"set\":{\"health\":1}}]",
+            "[{\"id\":1,\"set\":{\"health\":1}}]
+(see note [1])",
+            "Nothing [] yet, see [1]: [{\"id\":1,\"set\":{\"health\":1}}] ok]",
+        ] {
+            assert_eq!(parse_patch(text, &s).unwrap().len(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn llm_json_stays_within_byte_limit() {
+        let s = snapshot();
+        let full = s.to_llm_json(&SnapshotLimits::default());
+        assert!(!full.contains('\n'));
+        for max_json_bytes in [10, 40, full.len() - 1, full.len() + 32] {
+            let limits = SnapshotLimits {
+                max_json_bytes,
+                ..Default::default()
+            };
+            let json = s.to_llm_json(&limits);
+            assert!(json.len() <= max_json_bytes.max(32), "{max_json_bytes}");
+        }
+    }
+
+    #[test]
     fn rejects_type_mismatches() {
         let s = snapshot();
         for (patch, needle) in [
@@ -637,9 +681,9 @@ mod tests {
                 "more than once",
             ),
             (r#"[1]"#, "must be an object"),
-            (r#"{"id":1}"#, "no JSON array"),
-            (r#"[{"id":1,"set":{"health":1}"#, "no JSON array"),
-            (r#"[{"id":1 "set":{}}]"#, "invalid JSON"),
+            (r#"{"id":1}"#, "no valid JSON array"),
+            (r#"[{"id":1,"set":{"health":1}"#, "no valid JSON array"),
+            (r#"[{"id":1 "set":{}}]"#, "no valid JSON array"),
         ] {
             let errors = parse_patch(patch, &s).unwrap_err();
             assert!(

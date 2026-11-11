@@ -555,7 +555,7 @@ impl Player {
         }
 
         #[cfg(feature = "modkit")]
-        let dt = self.speed.scale_tick(dt, &mut self.start_time);
+        let dt = self.speed.scale_tick(dt);
 
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
@@ -664,7 +664,7 @@ impl Player {
     /// Audio is muted while the speed isn't normal.
     #[cfg(feature = "modkit")]
     pub fn set_speed(&mut self, factor: f64) {
-        self.speed.set(factor, self.audio.as_mut());
+        self.speed.set(factor, self.audio.as_mut(), self.start_time);
     }
 
     /// Replaces the mods of the running game: rules read from mod files by the
@@ -2408,6 +2408,8 @@ impl Player {
                 avm2,
                 external_interface,
                 start_time: this.start_time,
+                #[cfg(feature = "modkit")]
+                timer_clock: this.speed.clock(),
                 update_start: Instant::now(),
                 max_execution_duration: this.max_execution_duration,
                 focus_tracker: stage.focus_tracker(),

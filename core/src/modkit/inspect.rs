@@ -208,15 +208,25 @@ pub struct ReadProp<'gc> {
 /// with a setter (e.g. `x`, `alpha`) and dynamic properties.
 ///
 /// Game-defined getters are listed but never called, since they can have
-/// side effects.
+/// side effects. Without `include_builtin` the built-in accessors are left
+/// out and their getters are not called.
 pub fn read_props<'gc>(
     activation: &mut Activation<'_, 'gc>,
     object: Object<'gc>,
+    include_builtin: bool,
 ) -> Vec<ReadProp<'gc>> {
     let vtable = object.vtable();
     let traits: Vec<_> = vtable
         .resolved_traits()
         .iter()
+        .filter(|(_, _, prop)| {
+            matches!(
+                prop,
+                Property::Slot { .. }
+                    | Property::ConstSlot { .. }
+                    | Property::Virtual { get: Some(_), .. }
+            )
+        })
         .map(|(name, ns, prop)| (name.to_string(), ns.is_public(), *prop))
         .collect();
 
@@ -274,6 +284,9 @@ pub fn read_props<'gc>(
                 } else {
                     // Only built-in accessors that can be written are useful here.
                     let Some(set) = set else { continue };
+                    if !include_builtin {
+                        continue;
+                    }
                     let Ok(value) = Value::from(object).call_method(get, &[], activation) else {
                         continue;
                     };
@@ -339,11 +352,19 @@ fn read_dynamic_props<'gc>(
     object: Object<'gc>,
 ) -> Vec<ReadProp<'gc>> {
     let mut out = Vec::new();
-    if object.as_array_storage().is_some() || object.as_function_object().is_some() {
+    // Enumerating a Proxy runs game code, so it is never done.
+    if object.as_array_storage().is_some()
+        || object.as_function_object().is_some()
+        || matches!(object, Object::ProxyObject(_))
+    {
         return out;
     }
     let mut index = 0;
-    while out.len() < MAX_DYNAMIC_PROPS {
+    // Bounded by iterations: keys that are not strings are skipped.
+    for _ in 0..MAX_DYNAMIC_PROPS * 4 {
+        if out.len() >= MAX_DYNAMIC_PROPS {
+            break;
+        }
         index = match object.get_next_enumerant(index, activation) {
             Ok(0) | Err(_) => break,
             Ok(next) => next,
@@ -546,7 +567,7 @@ pub fn build_snapshot<'gc>(
         }
         let id = registry.id_for(activation.context, object);
         let mut props = Vec::new();
-        for ReadProp { mut entry, target } in read_props(activation, object) {
+        for ReadProp { mut entry, target } in read_props(activation, object, true) {
             if let Some(target) = target
                 && depth < limits.max_depth
             {
@@ -563,6 +584,15 @@ pub fn build_snapshot<'gc>(
             instance_name: instance_name(object),
             props,
         });
+    }
+    // Refs to objects cut by `max_objects` would dangle.
+    let present: HashSet<u32> = snapshot.objects.iter().map(|o| o.id).collect();
+    for object in &mut snapshot.objects {
+        for prop in &mut object.props {
+            if prop.object_ref.is_some_and(|id| !present.contains(&id)) {
+                prop.object_ref = None;
+            }
+        }
     }
     snapshot
 }

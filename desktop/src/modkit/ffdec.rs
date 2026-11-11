@@ -5,13 +5,18 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::UNIX_EPOCH;
+use std::process::{Command, Output, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use url::Url;
 
 /// Don't hang forever on a pathological class.
 const EXPORT_TIMEOUT_SECS: &str = "120";
+/// FFDec's own timeout doesn't cover a hang outside the export, so the
+/// process is killed after this long.
+const EXPORT_DEADLINE: Duration = Duration::from_secs(150);
 
 /// Decompiles one AS3 class and returns its source.
 ///
@@ -34,7 +39,8 @@ pub fn export_class_source(
         return Ok(source);
     }
 
-    let output = ffdec_command(&ffdec)
+    let mut command = ffdec_command(&ffdec);
+    command
         .arg("-exportTimeout")
         .arg(EXPORT_TIMEOUT_SECS)
         .arg("-selectclass")
@@ -42,8 +48,8 @@ pub fn export_class_source(
         .arg("-export")
         .arg("script")
         .arg(&out_dir)
-        .arg(&swf)
-        .output()
+        .arg(&swf);
+    let output = output_with_deadline(&mut command, EXPORT_DEADLINE)
         .map_err(|e| format!("Couldn't run FFDec ({}): {e}", ffdec.display()))?;
 
     if let Ok(source) = std::fs::read_to_string(&expected) {
@@ -65,6 +71,53 @@ pub fn export_class_source(
     ))
 }
 
+/// Like `Command::output`, but kills the process when it runs too long.
+fn output_with_deadline(command: &mut Command, deadline: Duration) -> Result<Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    // The pipes are drained while waiting, a full pipe would block the child.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {} s", deadline.as_secs()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
 /// Opens the SWF in the FFDec GUI (which lives next to the CLI).
 pub fn open_gui(ffdec_path: &str, swf_url: &str) -> Result<(), String> {
     let cli = ffdec_executable(ffdec_path)?;
@@ -82,11 +135,15 @@ pub fn open_gui(ffdec_path: &str, swf_url: &str) -> Result<(), String> {
     } else {
         Command::new(&gui)
     };
-    command
+    let mut child = command
         .arg(&swf)
         .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Couldn't start {}: {e}", gui.display()))
+        .map_err(|e| format!("Couldn't start {}: {e}", gui.display()))?;
+    // Reap the process when the user closes FFDec, or it stays a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn ffdec_executable(ffdec_path: &str) -> Result<PathBuf, String> {

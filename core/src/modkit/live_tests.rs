@@ -78,7 +78,7 @@ fn tracked_of_class<'gc>(activation: &mut Activation<'_, 'gc>, class: &str) -> O
 }
 
 fn set_int<'gc>(activation: &mut Activation<'_, 'gc>, object: Object<'gc>, name: &str, v: i32) {
-    let prop = inspect::read_props(activation, object)
+    let prop = inspect::read_props(activation, object, true)
         .into_iter()
         .find(|p| p.entry.name == name)
         .unwrap_or_else(|| panic!("{name} not found"));
@@ -108,7 +108,7 @@ fn with_activation<R>(
 }
 
 fn static_int<'gc>(activation: &mut Activation<'_, 'gc>, stats: Object<'gc>, name: &str) -> i32 {
-    let prop = inspect::read_props(activation, stats)
+    let prop = inspect::read_props(activation, stats, true)
         .into_iter()
         .find(|p| p.entry.name == name)
         .unwrap_or_else(|| panic!("Stats.{name} not found"));
@@ -126,7 +126,7 @@ fn live_edit_static_and_continue() {
     let mut registry = Registry::default();
     let before = with_activation(&player, |activation| {
         let stats = inspect::find_class_object(activation, "Stats").expect("Stats class");
-        let props = inspect::read_props(activation, stats);
+        let props = inspect::read_props(activation, stats, true);
         let bullet = props
             .iter()
             .find(|p| p.entry.name == "bulletNum")
@@ -216,7 +216,7 @@ fn live_pick_and_move_display_object() {
             }
         }
         let object = found.expect("no game object under any grid point");
-        let props = inspect::read_props(activation, object);
+        let props = inspect::read_props(activation, object, true);
         let x = props
             .iter()
             .find(|p| p.entry.name == "x")
@@ -493,7 +493,7 @@ fn edit_int<'gc>(
     value: i32,
 ) {
     let id = modkit.registry.id_for(activation.context, object);
-    let prop = inspect::read_props(activation, object)
+    let prop = inspect::read_props(activation, object, true)
         .into_iter()
         .find(|p| p.entry.name == name)
         .unwrap_or_else(|| panic!("{name} not found"));
@@ -708,7 +708,7 @@ fn live_save_session_edits() {
         let speed = static_int(activation, stats, "attackSpeed");
         let bullets = static_int(activation, stats, "bulletNum");
         // A third property that is edited and changed back.
-        let props = inspect::read_props(activation, stats);
+        let props = inspect::read_props(activation, stats, true);
         let other = props
             .iter()
             .find(|p| {
@@ -819,4 +819,18 @@ fn live_ai_real_model_round_trip() {
     with_activation(&player, |activation| modkit.apply_ai(activation, false));
     assert!(!modkit.should_suspend_player());
     run_frames(&player, 30);
+}
+
+/// Request ids never repeat between players, and a status response is shown.
+#[test]
+fn request_ids_and_status_response() {
+    let mut a = Modkit::default();
+    let mut b = Modkit::default();
+    let first = a.next_id();
+    assert_ne!(first, b.next_id());
+    assert_ne!(first, a.next_id());
+
+    a.push_host_response(HostResponse::Status("Couldn't open X".into()));
+    assert_eq!(a.status, "Couldn't open X");
+    assert!(!a.adopt_pending);
 }

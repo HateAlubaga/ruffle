@@ -34,6 +34,10 @@ pub struct HashCache {
 }
 
 impl HashCache {
+    pub const fn new() -> Self {
+        Self { cached: None }
+    }
+
     pub fn hash(&mut self, path: &Path) -> Result<String, String> {
         let meta =
             std::fs::metadata(path).map_err(|e| format!("Can't read {}: {e}", path.display()))?;
@@ -146,12 +150,17 @@ pub fn reload(
     let dir = mods_dir(config_dir);
     // A movie that was not loaded from a file has no hash; mods bound to a
     // SWF then show up as "other SWF" instead of applying to the wrong game.
-    let sha = super::ffdec::swf_path(movie_url)
-        .and_then(|path| hashes.hash(&path))
-        .map_err(|e| tracing::debug!("No SWF hash for mods: {e}"))
-        .ok();
     let (sources, fingerprint) = read_sources(&dir);
     let files = sources.len();
+    // Hashing a big SWF is slow and nothing uses the hash without mod files.
+    let sha = if sources.is_empty() {
+        None
+    } else {
+        super::ffdec::swf_path(movie_url)
+            .and_then(|path| hashes.hash(&path))
+            .map_err(|e| tracing::debug!("No SWF hash for mods: {e}"))
+            .ok()
+    };
     player.install_mods(
         sources,
         sha,

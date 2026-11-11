@@ -28,9 +28,14 @@ use crate::modkit::model::{Access, Change, PropValue, Snapshot, SnapshotLimits};
 use crate::modkit::mods::{RuleSpec, Target, Trigger};
 use gc_arena::DynamicRootSet;
 use ruffle_render::matrix::Matrix;
+use std::sync::atomic::{AtomicU64, Ordering};
 use swf::{Color, Twips};
 
 pub use crate::modkit::speed::{MAX_SPEED, MIN_SPEED};
+
+/// Request ids are unique across players: the host outlives a `Player`, so a
+/// late response for an old one must not match a request of the new one.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AiProvider {
@@ -145,6 +150,8 @@ pub enum HostResponse {
     },
     /// The mods were (re)installed or a mod file operation finished.
     Mods(Result<String, String>),
+    /// A message for the status line.
+    Status(String),
 }
 
 #[derive(Debug, Clone)]
@@ -181,8 +188,9 @@ enum AiState {
         snapshot: Snapshot,
     },
     Review {
-        snapshot: Snapshot,
         changes: Vec<Change>,
+        /// One description per change, built once.
+        lines: Vec<String>,
         enabled: Vec<bool>,
         raw: String,
     },
@@ -252,9 +260,12 @@ pub struct Modkit {
     /// Selected object hovered in the window, highlighted on stage.
     hovered: Option<u32>,
     class_input: String,
-    class_names: Option<Vec<String>>,
+    /// Game class names with their lowercase copies.
+    class_names: Option<Vec<(String, String)>>,
     show_builtin: bool,
     undo: Vec<UndoBatch>,
+    /// Cached `session_edits().len()`.
+    edit_count: usize,
     locks: Vec<Lock>,
     status: String,
     ai: Ai,
@@ -262,7 +273,6 @@ pub struct Modkit {
     settings: ModkitSettings,
     settings_dirty: bool,
     requests: Vec<HostRequest>,
-    next_request_id: u64,
     /// Current and requested player speed; the player syncs these.
     speed: f64,
     speed_request: Option<f64>,
@@ -313,6 +323,7 @@ impl Modkit {
                 }
                 Err(e) => self.status = format!("Mods: {e}"),
             },
+            HostResponse::Status(message) => self.status = message,
         }
     }
 
@@ -346,8 +357,11 @@ impl Modkit {
     }
 
     fn next_id(&mut self) -> u64 {
-        self.next_request_id += 1;
-        self.next_request_id
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn refresh_edit_count(&mut self) {
+        self.edit_count = self.session_edits().len();
     }
 
     fn selected_objects<'gc>(&self, dynamic_root: DynamicRootSet<'gc>) -> Vec<Object<'gc>> {
@@ -360,6 +374,8 @@ impl Modkit {
     fn select(&mut self, id: u32, add: bool) {
         if !add {
             self.selection.clear();
+            // A lock of an object that left the selection could not be released.
+            self.locks.retain(|l| l.id == id);
         }
         if !self.selection.contains(&id) {
             self.selection.push(id);
@@ -413,6 +429,7 @@ impl Modkit {
         {
             entry.new = new;
             last.last_pass = Some(pass);
+            self.refresh_edit_count();
             return;
         }
         self.undo.push(UndoBatch {
@@ -426,6 +443,7 @@ impl Modkit {
             }],
             last_pass: pass,
         });
+        self.refresh_edit_count();
     }
 
     fn undo<'gc>(&mut self, activation: &mut Activation<'_, 'gc>) {
@@ -457,6 +475,7 @@ impl Modkit {
         } else {
             format!("Undid {} ({failed} writes failed)", batch.label)
         };
+        self.refresh_edit_count();
     }
 
     /// Applies a validated patch as one undo step. Each property is looked
@@ -477,7 +496,7 @@ impl Modkit {
                 errors.push(format!("#{}: object is gone", change.id));
                 continue;
             };
-            let current = inspect::read_props(activation, object)
+            let current = inspect::read_props(activation, object, true)
                 .into_iter()
                 .map(|r| r.entry)
                 .find(|p| p.name == change.prop);
@@ -501,13 +520,23 @@ impl Modkit {
                 continue;
             }
             match inspect::write_prop(activation, object, &prop.access, &change.new) {
-                Ok(()) => entries.push(UndoEntry {
-                    id: change.id,
-                    prop: change.prop.clone(),
-                    access: prop.access,
-                    old,
-                    new: change.new.clone(),
-                }),
+                Ok(()) => {
+                    // Keep a lock on this property from reverting the change.
+                    if let Some(lock) = self
+                        .locks
+                        .iter_mut()
+                        .find(|l| l.id == change.id && l.prop == change.prop)
+                    {
+                        lock.value = change.new.clone();
+                    }
+                    entries.push(UndoEntry {
+                        id: change.id,
+                        prop: change.prop.clone(),
+                        access: prop.access,
+                        old,
+                        new: change.new.clone(),
+                    });
+                }
                 Err(e) => errors.push(format!("#{} {}: {e}", change.id, change.prop)),
             }
         }
@@ -519,6 +548,7 @@ impl Modkit {
                 entries,
                 last_pass: None,
             });
+            self.refresh_edit_count();
         }
         self.status = if errors.is_empty() {
             format!("Applied {applied} changes")
@@ -730,7 +760,7 @@ impl Modkit {
             Ok(raw) => match model::parse_patch(&raw, &snapshot) {
                 Ok(changes) => AiState::Review {
                     enabled: vec![true; changes.len()],
-                    snapshot,
+                    lines: model::describe_changes(&changes, &snapshot),
                     changes,
                     raw,
                 },
@@ -812,6 +842,12 @@ impl Modkit {
         if !self.open {
             self.picking = false;
             self.adopt_pending = false;
+            // Locks hold while the window is closed.
+            if !self.locks.is_empty() {
+                let domain = context.avm2.stage_domain();
+                let mut activation = Activation::from_domain(context, domain);
+                self.apply_locks(&mut activation);
+            }
             return;
         }
         let domain = context.avm2.stage_domain();

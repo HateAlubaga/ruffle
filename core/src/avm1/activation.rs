@@ -1255,9 +1255,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             *self.context.time_offset += 1;
         }
 
+        #[cfg(not(feature = "modkit"))]
         let time = Instant::now()
             .duration_since(self.context.start_time)
             .as_millis() as u32;
+        #[cfg(feature = "modkit")]
+        let time = self
+            .context
+            .timer_clock
+            .millis(Instant::now(), self.context.start_time);
         let result = time.wrapping_add(*self.context.time_offset);
         self.context.avm1.push(result.into());
         Ok(FrameControl::Continue)

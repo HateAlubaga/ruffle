@@ -185,6 +185,10 @@ pub struct UpdateContext<'gc> {
     /// The instant at which the SWF was launched.
     pub start_time: Instant,
 
+    /// Scaled `getTimer()` clock (Modkit speed).
+    #[cfg(feature = "modkit")]
+    pub timer_clock: crate::modkit::speed::TimerClock,
+
     /// The instant at which the current update started.
     pub update_start: Instant,
 

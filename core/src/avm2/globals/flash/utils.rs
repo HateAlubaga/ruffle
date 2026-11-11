@@ -21,6 +21,13 @@ pub fn get_timer<'gc>(
     _this: Value<'gc>,
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
+    #[cfg(feature = "modkit")]
+    return Ok(activation
+        .context
+        .timer_clock
+        .millis(Instant::now(), activation.context.start_time)
+        .into());
+    #[cfg(not(feature = "modkit"))]
     Ok((Instant::now()
         .duration_since(activation.context.start_time)
         .as_millis() as u32)

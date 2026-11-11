@@ -16,6 +16,7 @@ use ruffle_core::modkit::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const SETTINGS_FILE: &str = "modkit.json";
@@ -34,13 +35,25 @@ const SPEED_STEPS: &[f64] = &[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0];
 /// How often the mods folder is checked for edits.
 const MODS_POLL_EVERY: Duration = Duration::from_secs(1);
 
+/// Settings are written once typing has paused for this long.
+const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// One SWF hash cache for the whole process, so opening a movie and the
+/// first mod operation don't hash the same file twice.
+static HASHES: Mutex<mods::HashCache> = Mutex::new(mods::HashCache::new());
+
+fn hashes() -> MutexGuard<'static, mods::HashCache> {
+    HASHES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct ModkitHost {
     config_dir: PathBuf,
     settings: ModkitSettings,
     settings_path: PathBuf,
+    /// When the settings last changed without being written yet.
+    settings_dirty_since: Option<Instant>,
     responses_tx: Sender<HostResponse>,
     responses_rx: Receiver<HostResponse>,
-    hashes: mods::HashCache,
     mods_polled: Instant,
     /// State of the mods folder at the last install or poll.
     mods_seen: Option<mods::Fingerprint>,
@@ -49,12 +62,7 @@ pub struct ModkitHost {
 /// Installs the mods for a movie that was just requested. Call it right after
 /// `fetch_root_movie`, before the first frame.
 pub fn install_initial(player: &mut Player, config_dir: &Path, movie_url: &str) {
-    let loaded = mods::reload(
-        player,
-        config_dir,
-        &mut mods::HashCache::default(),
-        movie_url,
-    );
+    let loaded = mods::reload(player, config_dir, &mut hashes(), movie_url);
     if loaded.files > 0 {
         tracing::info!(
             "Loaded {} mod file(s) from {}",
@@ -76,9 +84,9 @@ impl ModkitHost {
             config_dir,
             settings,
             settings_path,
+            settings_dirty_since: None,
             responses_tx,
             responses_rx,
-            hashes: mods::HashCache::default(),
             mods_polled: Instant::now(),
             mods_seen: None,
         }
@@ -92,11 +100,7 @@ impl ModkitHost {
             let modkit = debug_ui.modkit();
             if let Some(changed) = modkit.take_changed_settings() {
                 self.settings = changed;
-                if let Err(e) =
-                    std::fs::write(&self.settings_path, settings_to_json(&self.settings))
-                {
-                    tracing::warn!("Couldn't save Modkit settings: {e}");
-                }
+                self.settings_dirty_since = Some(Instant::now());
             } else if modkit.settings() != &self.settings {
                 // A new player starts with default settings.
                 modkit.set_settings(self.settings.clone());
@@ -107,27 +111,52 @@ impl ModkitHost {
             )
         };
 
+        if self
+            .settings_dirty_since
+            .is_some_and(|since| since.elapsed() >= SETTINGS_SAVE_DELAY)
+        {
+            self.save_settings();
+        }
+
         // Mod operations reinstall the mods, which needs the player without
-        // the debug UI borrowed.
+        // the debug UI borrowed. A batch is reinstalled once, at the end.
         let mut responses = Vec::new();
+        let mut done = Vec::new();
+        let mut errors = Vec::new();
         for request in requests {
             let result = match request {
                 HostRequest::SaveRule { rule } => {
-                    self.with_movie(&movie_url, |host, url| host.save_rule(player, url, &rule))
+                    self.with_movie(&movie_url, |host, url| host.save_rule(url, &rule))
                 }
-                HostRequest::RemoveRule { file, rule } => self
-                    .with_movie(&movie_url, |host, url| {
-                        host.remove_rule(player, url, &file, &rule)
-                    }),
-                HostRequest::ReloadMods => self.with_movie(&movie_url, |host, url| {
-                    Ok(host.reload(player, url, "Reloaded mods"))
-                }),
+                HostRequest::RemoveRule { file, rule } => {
+                    self.with_movie(&movie_url, |host, _| host.remove_rule(&file, &rule))
+                }
+                HostRequest::ReloadMods => {
+                    self.with_movie(&movie_url, |_, _| Ok("Reloaded mods".to_string()))
+                }
                 other => {
                     self.start(other);
                     continue;
                 }
             };
-            responses.push(HostResponse::Mods(result));
+            match result {
+                Ok(message) => done.push(message),
+                Err(e) => errors.push(e),
+            }
+        }
+        if !done.is_empty()
+            && let Some(url) = &movie_url
+        {
+            let what = if done.len() == 1 {
+                done.remove(0)
+            } else {
+                format!("Applied {} mod changes", done.len())
+            };
+            responses.push(HostResponse::Mods(Ok(self.reload(player, url, &what))));
+        }
+        // The error goes last so that it stays visible.
+        if !errors.is_empty() {
+            responses.push(HostResponse::Mods(Err(errors.join("; "))));
         }
         if let Some(url) = &movie_url
             && let Some(response) = self.poll_mods(player, url)
@@ -156,50 +185,53 @@ impl ModkitHost {
         }
     }
 
+    fn save_settings(&mut self) {
+        self.settings_dirty_since = None;
+        // Through a temp file: a crash mid-write must not lose the settings.
+        let tmp = self.settings_path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, settings_to_json(&self.settings))
+            .and_then(|_| std::fs::rename(&tmp, &self.settings_path))
+        {
+            tracing::warn!("Couldn't save Modkit settings: {e}");
+        }
+    }
+
     fn mods_dir(&self) -> PathBuf {
         mods::mods_dir(&self.config_dir)
     }
 
     fn reload(&mut self, player: &mut Player, movie_url: &str, what: &str) -> String {
-        let loaded = mods::reload(player, &self.config_dir, &mut self.hashes, movie_url);
+        let loaded = mods::reload(player, &self.config_dir, &mut hashes(), movie_url);
         self.mods_seen = Some(loaded.fingerprint);
         self.mods_polled = Instant::now();
         format!("{what} ({} mod file(s))", loaded.files)
     }
 
-    fn save_rule(
-        &mut self,
-        player: &mut Player,
-        movie_url: &str,
-        rule: &RuleSpec,
-    ) -> Result<String, String> {
+    /// Edits the mod file only; the caller reloads the mods.
+    fn save_rule(&self, movie_url: &str, rule: &RuleSpec) -> Result<String, String> {
         let path = ffdec::swf_path(movie_url)
             .map_err(|e| format!("a rule needs a mod file bound to a local SWF, but {e}"))?;
-        let sha = self.hashes.hash(&path)?;
+        let sha = hashes().hash(&path)?;
         let stem = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
         let saved = mods::save_rule(&self.mods_dir(), &stem, &sha, rule)?;
-        let what = format!(
+        Ok(format!(
             "{} rule for {} in {}",
             if saved.replaced { "Updated" } else { "Saved" },
             rule.normalized_class(),
             saved.file
-        );
-        Ok(self.reload(player, movie_url, &what))
+        ))
     }
 
-    fn remove_rule(
-        &mut self,
-        player: &mut Player,
-        movie_url: &str,
-        file: &str,
-        rule: &RuleSpec,
-    ) -> Result<String, String> {
+    /// Edits the mod file only; the caller reloads the mods.
+    fn remove_rule(&self, file: &str, rule: &RuleSpec) -> Result<String, String> {
         mods::remove_rule(&self.mods_dir(), file, rule)?;
-        let what = format!("Removed rule for {} from {file}", rule.normalized_class());
-        Ok(self.reload(player, movie_url, &what))
+        Ok(format!(
+            "Removed rule for {} from {file}",
+            rule.normalized_class()
+        ))
     }
 
     /// Reloads the mods when a file in the mods folder was edited.
@@ -253,7 +285,9 @@ impl ModkitHost {
                 swf_url,
             } => {
                 if let Err(e) = ffdec::open_gui(&self.settings.ffdec_path, &swf_url) {
-                    tracing::warn!("Couldn't open {class_name} in FFDec: {e}");
+                    let _ = tx.send(HostResponse::Status(format!(
+                        "Couldn't open {class_name} in FFDec: {e}"
+                    )));
                 }
             }
             HostRequest::SaveRule { .. }
@@ -261,6 +295,15 @@ impl ModkitHost {
             | HostRequest::ReloadMods => {
                 unreachable!("mod requests are handled by pump, they need the player")
             }
+        }
+    }
+}
+
+impl Drop for ModkitHost {
+    fn drop(&mut self) {
+        // A change made right before exit must not be lost.
+        if self.settings_dirty_since.is_some() {
+            self.save_settings();
         }
     }
 }
